@@ -3242,7 +3242,7 @@ def generate_tour_sanction_pdf(row):
                 pdf.set_xy(20, y - 7)
                 pdf.cell(65, 6, supp_by, align="C")
             pdf.set_xy(20, y + 2)
-            pdf.multi_cell(65, 6, "སྡེ་ཚན་འགན་འཛིན་གྱི་རྒྱབ་གཉེར།", align="C")
+            pdf.multi_cell(65, 6, "འབྲེལ་ཡོད་ཟུང་དྲུང་གྱི་རྒྱབ་གཉེར།", align="C")
 
             # Staff / Applicant (Right): ALWAYS display applicant signature
             pdf.set_xy(125, y - 7)
