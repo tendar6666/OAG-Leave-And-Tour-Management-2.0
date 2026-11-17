@@ -30,22 +30,22 @@ cookie_manager = stx.CookieManager(key="main_cookie_manager")
 
 if "pending_cookie" in st.session_state:
     expire_date = datetime.now(CTA_TZ) + timedelta(days=60)
-    cookie_manager.set("auth_token", st.session_state.pending_cookie, expires_at=expire_date)
+    cookie_manager.set("auth_token", st.session_state.pending_cookie, key="set_auth_token", expires_at=expire_date)
     del st.session_state.pending_cookie
 
 if "pending_gmail_cookie" in st.session_state:
     expire_date = datetime.now(CTA_TZ) + timedelta(days=60)
-    cookie_manager.set("cta_verified_gmail", st.session_state.pending_gmail_cookie, expires_at=expire_date)
+    cookie_manager.set("cta_verified_gmail", st.session_state.pending_gmail_cookie, key="set_verified_gmail", expires_at=expire_date)
     del st.session_state.pending_gmail_cookie
 
 if st.session_state.get("pending_cookie_delete"):
     try:
-        cookie_manager.delete("auth_token")
+        cookie_manager.delete("auth_token", key="del_auth_token")
     except Exception:
         pass
     if st.session_state.get("pending_full_signout"):
         try:
-            cookie_manager.delete("cta_verified_gmail")
+            cookie_manager.delete("cta_verified_gmail", key="del_verified_gmail")
         except Exception:
             pass
         del st.session_state["pending_full_signout"]
@@ -3684,7 +3684,8 @@ def login_screen():
     if oauth_active and getattr(st.user, "is_logged_in", False):
         oauth_email = str(st.user.email).strip().lower()
         st.session_state["perimeter_verified_email"] = oauth_email
-        st.session_state["pending_gmail_cookie"] = oauth_email
+        if str(remembered_email or "").strip().lower() != oauth_email:
+            st.session_state["pending_gmail_cookie"] = oauth_email
 
     # 3. Determine if perimeter is verified
     if "perimeter_verified_email" in st.session_state and st.session_state["perimeter_verified_email"]:
