@@ -16,6 +16,10 @@ import requests
 import json
 import html
 import re
+import inspect
+import math
+import random
+import time
 
 try:
     from zoneinfo import ZoneInfo
@@ -143,6 +147,121 @@ if "user_email" not in st.session_state:
 # --- DATABASE CONNECTION ---
 conn = st.connection("gsheets", type=GSheetsConnection)
 
+_TRANSIENT_HTTP_STATUSES = {429, 500, 502, 503, 504}
+_TRANSIENT_ERR_MARKERS = (
+    "429",
+    "500",
+    "502",
+    "503",
+    "504",
+    "resource_exhausted",
+    "quota exceeded",
+    "rate limit",
+    "too many requests",
+    "service unavailable",
+    "bad gateway",
+    "gateway timeout",
+    "timed out",
+    "timeout",
+    "connection reset",
+    "temporarily unavailable",
+)
+
+
+def _is_transient_gsheets_error(exc):
+    resp = getattr(exc, "response", None)
+    status = getattr(resp, "status_code", None)
+    if isinstance(status, int):
+        return status in _TRANSIENT_HTTP_STATUSES
+    if "worksheetnotfound" in type(exc).__name__.lower():
+        return False
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return True
+    msg = str(exc).lower()
+    if "worksheetnotfound" in msg or "worksheet not found" in msg or "404" in msg or "403" in msg:
+        return False
+    return any(marker in msg for marker in _TRANSIENT_ERR_MARKERS)
+
+
+def _gsheets_retry(fn, *args, max_attempts=4, base_delay=0.5, max_delay=8.0, **kwargs):
+    attempt = 0
+    while True:
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:
+            attempt += 1
+            if attempt >= max_attempts or not _is_transient_gsheets_error(exc):
+                raise
+            delay = min(max_delay, base_delay * (2 ** (attempt - 1)))
+            delay += random.uniform(0.0, delay * 0.25)
+            time.sleep(delay)
+
+
+def _gsheets_read(active_conn, worksheet, **kwargs):
+    read_kwargs = dict(kwargs)
+    if "ttl" not in read_kwargs:
+        accepts_ttl = True
+        try:
+            sig = inspect.signature(active_conn.read)
+            params = sig.parameters
+            accepts_ttl = (
+                "ttl" in params
+                or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+            )
+        except (ValueError, TypeError):
+            accepts_ttl = True
+        if accepts_ttl:
+            read_kwargs["ttl"] = 0
+    try:
+        return _gsheets_retry(active_conn.read, worksheet=worksheet, **read_kwargs)
+    except TypeError as te:
+        if "ttl" in read_kwargs and "ttl" in str(te):
+            read_kwargs.pop("ttl", None)
+            return _gsheets_retry(active_conn.read, worksheet=worksheet, **read_kwargs)
+        raise
+
+
+def _clear_fn_cache(fn_name):
+    fn = globals().get(fn_name)
+    clear_fn = getattr(fn, "clear", None)
+    if callable(clear_fn):
+        try:
+            clear_fn()
+        except Exception:
+            pass
+
+
+def _invalidate_sheet_cache(*sheet_names):
+    mapping = {
+        "Users": ("load_users_data",),
+        "Staff_Master": ("load_staff_master",),
+        "LeaveRules": ("_read_leave_rules_sheet",),
+        "AuditLog": ("_load_audit_log_cached", "load_audit_log"),
+        "LeaveRequests": ("load_leave_requests",),
+        "TourSanctions": ("load_tour_sanctions",),
+        "Titles": ("_list_spreadsheet_sheet_titles",),
+    }
+    cleared = set()
+    for name in sheet_names:
+        if name in mapping:
+            targets = mapping[name]
+        elif str(name).startswith(("LeaveRequests_Archive_", "TourSanctions_Archive_", "AuditLog_Archive_")):
+            targets = ("_list_spreadsheet_sheet_titles", "_read_archive_worksheet_cached")
+        else:
+            targets = ()
+        for fn_name in targets:
+            if fn_name not in cleared:
+                _clear_fn_cache(fn_name)
+                cleared.add(fn_name)
+
+
+def _invalidate_all_data_caches():
+    _invalidate_sheet_cache(
+        "Users", "Staff_Master", "LeaveRules", "AuditLog",
+        "LeaveRequests", "TourSanctions", "Titles",
+    )
+    _clear_fn_cache("_read_archive_worksheet_cached")
+
 BRANCH_NAMES = {
     "HQ": "དབུས། (Headquarters)",
     "SB": "South Branch (ལྷོ་ཕྱོགས་ཡན་ལག)",
@@ -154,7 +273,7 @@ BRANCH_NAMES = {
 @st.cache_data(ttl=60)
 def load_users_data():
     try:
-        df = conn.read(worksheet="Users")
+        df = _gsheets_read(conn, "Users")
         if df is None:
             return None
         df = df.dropna(subset=["Name", "PIN"])
@@ -449,7 +568,7 @@ def get_branch_manager(branch_code):
 
 @st.cache_data(ttl=60)
 def load_staff_master():
-    df = conn.read(worksheet="Staff_Master")
+    df = _gsheets_read(conn, "Staff_Master")
     if df is not None and not df.empty:
         if "Branch" not in df.columns:
             df["Branch"] = "HQ"
@@ -982,7 +1101,7 @@ def calculate_pro_rata_ul_penalties(ul_days, rules_override=None):
 
 @st.cache_data(ttl=60)
 def _read_leave_rules_sheet():
-    return conn.read(worksheet="LeaveRules")
+    return _gsheets_read(conn, "LeaveRules")
 
 
 def load_leave_rules(conn_override=None, force_refresh=False):
@@ -999,7 +1118,8 @@ def load_leave_rules(conn_override=None, force_refresh=False):
             ):
                 df = cached_reader()
             else:
-                df = active_conn.read(worksheet="LeaveRules")
+                _gs_read = globals().get("_gsheets_read")
+                df = _gs_read(active_conn, "LeaveRules") if callable(_gs_read) else active_conn.read(worksheet="LeaveRules")
             if isinstance(df, pd.DataFrame) and not df.empty and "LeaveType" in df.columns:
                 parsed = leave_rules_from_df(df)
                 try:
@@ -1025,9 +1145,10 @@ def save_leave_rules(rules_dict, conn_override=None):
     if active_conn is None:
         return False, df_out
 
+    _retry_fn = globals().get("_gsheets_retry")
     try:
         if hasattr(active_conn, "client") and hasattr(active_conn.client, "_open_spreadsheet"):
-            spread = active_conn.client._open_spreadsheet(spreadsheet=None, folder_id=None)
+            spread = _retry_fn(active_conn.client._open_spreadsheet, spreadsheet=None, folder_id=None) if callable(_retry_fn) else active_conn.client._open_spreadsheet(spreadsheet=None, folder_id=None)
             if spread is not None:
                 try:
                     spread.worksheet("LeaveRules")
@@ -1037,10 +1158,18 @@ def save_leave_rules(rules_dict, conn_override=None):
         pass
 
     try:
-        active_conn.update(worksheet="LeaveRules", data=df_out)
+        if callable(_retry_fn):
+            _retry_fn(active_conn.update, worksheet="LeaveRules", data=df_out)
+        else:
+            active_conn.update(worksheet="LeaveRules", data=df_out)
         try:
-            if hasattr(st, "cache_data") and hasattr(st.cache_data, "clear"):
-                st.cache_data.clear()
+            _inv = globals().get("_invalidate_sheet_cache")
+            if callable(_inv):
+                _inv("LeaveRules")
+            else:
+                _fn = globals().get("_read_leave_rules_sheet")
+                if callable(getattr(_fn, "clear", None)):
+                    _fn.clear()
         except Exception:
             pass
         return True, df_out
@@ -1106,6 +1235,27 @@ def inject_balance_formulas(df, df_req_override=None, reference_date=None, rules
             }
 
     df_req_eff = df_req_override if df_req_override is not None else load_leave_requests()
+    req_by_name = {}
+    empty_req_df = pd.DataFrame(columns=df_req_eff.columns) if isinstance(df_req_eff, pd.DataFrame) else pd.DataFrame()
+    if isinstance(df_req_eff, pd.DataFrame) and not df_req_eff.empty and "Name" in df_req_eff.columns:
+        sub_req = df_req_eff
+        if "Status" in sub_req.columns:
+            sub_req = sub_req[sub_req["Status"].astype(str).str.strip() == "Approved"]
+        if not sub_req.empty and "LeaveType" in sub_req.columns:
+            extra_svc = {
+                k for k, v in _lt_rules.items()
+                if k != "UL" and isinstance(v, dict) and bool(v.get("Affects_Service_Year", False))
+            }
+            svc_names = {"UL", "Return-UL", "Rev-UL"} | set(extra_svc) | {f"Return-{k}" for k in extra_svc} | {f"Rev-{k}" for k in extra_svc}
+            lt_mask = sub_req["LeaveType"].astype(str).str.strip().isin(svc_names)
+            if "EffectsServiceYear" in sub_req.columns:
+                eff_mask = sub_req["EffectsServiceYear"].astype(str).str.strip().str.lower() == "yes"
+                sub_req = sub_req[lt_mask | eff_mask]
+            else:
+                sub_req = sub_req[lt_mask]
+        if not sub_req.empty:
+            for emp_k, grp in sub_req.groupby(sub_req["Name"].astype(str).str.strip(), sort=False):
+                req_by_name[emp_k] = grp
 
     for i in range(len(df_copy)):
         name = str(df_copy.at[df_copy.index[i], "Name"]).strip()
@@ -1124,11 +1274,12 @@ def inject_balance_formulas(df, df_req_override=None, reference_date=None, rules
                     df_copy.at[df_copy.index[i], "Branch"] = u_map[name]["Branch"]
 
         # Calculate live non-regressive balances & tenure using the row being saved (never stale cache)
+        emp_req_df = req_by_name.get(name, empty_req_df) if req_by_name or isinstance(df_req_eff, pd.DataFrame) else df_req_eff
         try:
             bal = calculate_balances(
                 name,
                 user_row_override=df_copy.iloc[i],
-                df_req_override=df_req_eff,
+                df_req_override=emp_req_df,
                 reference_date=reference_date,
                 rules_override=rules_override,
             )
@@ -1136,7 +1287,7 @@ def inject_balance_formulas(df, df_req_override=None, reference_date=None, rules
             bal = calculate_balances(
                 name,
                 user_row_override=df_copy.iloc[i],
-                df_req_override=df_req_eff,
+                df_req_override=emp_req_df,
                 reference_date=reference_date,
             )
 
@@ -1457,6 +1608,152 @@ def process_auto_fy_rollover_df(staff_df, as_of_date=None, leave_df=None, rules_
     rolled_from_fys = set()
     rolled_count = 0
 
+    import math as _math
+    _tz = globals().get("CTA_TZ")
+
+    def _roll_parse_date(val):
+        if val is None:
+            return None
+        if isinstance(val, datetime):
+            if getattr(val, "tzinfo", None) is not None and _tz is not None:
+                return val.astimezone(_tz).date()
+            return val.date()
+        if hasattr(val, "to_pydatetime"):
+            try:
+                if pd.isnull(val):
+                    return None
+                ts = val.to_pydatetime()
+                if getattr(ts, "tzinfo", None) is not None and _tz is not None:
+                    return ts.astimezone(_tz).date()
+                return ts.date() if ts is not None else None
+            except Exception:
+                return None
+        if isinstance(val, date):
+            return val
+        try:
+            if pd.isnull(val):
+                return None
+        except Exception:
+            pass
+        s = str(val).strip()
+        if not s or s.lower() in ("nan", "none", "nat", "null"):
+            return None
+        if ("T" in s or s.endswith(("Z", "z"))) and len(s) > 10:
+            try:
+                dt = datetime.fromisoformat(s.replace("Z", "+00:00").replace("z", "+00:00"))
+                if dt.tzinfo is not None and _tz is not None:
+                    return dt.astimezone(_tz).date()
+                return dt.date()
+            except Exception:
+                pass
+        for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y", "%d/%m/%Y", "%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S"):
+            try:
+                return datetime.strptime(s, fmt).date()
+            except ValueError:
+                continue
+        try:
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is not None and _tz is not None:
+                return dt.astimezone(_tz).date()
+            return dt.date()
+        except Exception:
+            pass
+        if len(s) >= 10:
+            for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y", "%d/%m/%Y"):
+                try:
+                    return datetime.strptime(s[:10], fmt).date()
+                except ValueError:
+                    continue
+        return None
+
+    breakdown_func = globals().get("get_leave_fy_breakdown")
+    if breakdown_func is None:
+        def breakdown_func(s_d, e_d, t_d=None):
+            if s_d is None or e_d is None:
+                return {}
+            try:
+                s_d = pd.to_datetime(s_d).date() if not isinstance(s_d, date) else s_d
+                e_d = pd.to_datetime(e_d).date() if not isinstance(e_d, date) else e_d
+            except Exception:
+                return {}
+            if s_d > e_d:
+                return {}
+            tot_cal = (e_d - s_d).days + 1
+            if tot_cal <= 0:
+                return {}
+            s_yr = s_d.year if s_d.month >= 4 else s_d.year - 1
+            e_yr = e_d.year if e_d.month >= 4 else e_d.year - 1
+            from collections import OrderedDict
+            res = OrderedDict()
+            for y in range(s_yr, e_yr + 1):
+                c_s = max(s_d, date(y, 4, 1))
+                c_e = min(e_d, date(y + 1, 3, 31))
+                c_cal = max(0, (c_e - c_s).days + 1)
+                d = float(t_d) * (float(c_cal) / float(tot_cal)) if t_d is not None else float(c_cal)
+                res[y] = {"fy_year": y, "fy_label": f"FY {y}-{y + 1}", "seg_start": c_s, "seg_end": c_e, "days": round(d, 2)}
+            return res
+
+    _leave_loaded = False
+    effective_leave_df = leave_df
+    pen_leaves_by_name = None
+
+    def _get_pen_leaves_index():
+        nonlocal _leave_loaded, effective_leave_df, pen_leaves_by_name
+        if pen_leaves_by_name is not None:
+            return pen_leaves_by_name
+        if effective_leave_df is None and not _leave_loaded:
+            _leave_loaded = True
+            try:
+                effective_leave_df = load_leave_requests()
+            except Exception:
+                effective_leave_df = None
+        pen_leaves_by_name = {}
+        if effective_leave_df is not None and not effective_leave_df.empty and "Name" in effective_leave_df.columns:
+            pen_src = effective_leave_df
+            if "Status" in pen_src.columns:
+                pen_src = pen_src[pen_src["Status"].astype(str).str.strip() == "Approved"]
+            for _, l_row in pen_src.iterrows():
+                try:
+                    row_emp = str(l_row.get("Name", "")).strip()
+                    if not row_emp:
+                        continue
+                    l_t = str(l_row.get("LeaveType", "")).strip()
+                    if l_t.startswith("Return-"):
+                        base_lt = l_t[len("Return-"):].strip()
+                    elif l_t.startswith("Rev-"):
+                        base_lt = l_t[len("Rev-"):].strip()
+                    else:
+                        base_lt = l_t
+                    l_is_ul = (base_lt == "UL")
+                    rule_eff = bool(_lt_rules.get(base_lt, {}).get("Affects_Service_Year", False)) if not l_is_ul else False
+                    l_is_eff = False if l_is_ul else ((str(l_row.get("EffectsServiceYear", "")).strip().lower() == "yes") or rule_eff)
+                    if not (l_is_ul or l_is_eff):
+                        continue
+                    raw_td = l_row.get("TotalDays", 0.0)
+                    if raw_td is None or (isinstance(raw_td, float) and not _math.isfinite(raw_td)):
+                        continue
+                    try:
+                        if pd.isnull(raw_td):
+                            continue
+                    except Exception:
+                        pass
+                    s_td = str(raw_td).strip()
+                    if s_td == "" or s_td.startswith("="):
+                        continue
+                    l_d = float(s_td)
+                    if not _math.isfinite(l_d):
+                        continue
+                    l_s = _roll_parse_date(l_row.get("StartDate"))
+                    l_e = _roll_parse_date(l_row.get("EndDate"))
+                    if l_s is None or l_e is None:
+                        continue
+                    bdown = breakdown_func(l_s, l_e, l_d)
+                    if bdown:
+                        pen_leaves_by_name.setdefault(row_emp, []).append((l_is_ul, l_is_eff, bdown))
+                except Exception:
+                    continue
+        return pen_leaves_by_name
+
     for idx in out_df.index:
         raw_fy = out_df.at[idx, "Active_FY"]
         row_fy_year = parse_fy_start_year(raw_fy)
@@ -1478,11 +1775,16 @@ def process_auto_fy_rollover_df(staff_df, as_of_date=None, leave_df=None, rules_
             continue
 
         # March 31 midnight IST has passed: auto-rollover year by year up to target_start_year
-        rolled_over = True
-        needs_write = True
-        rolled_count += 1
+        j_raw = out_df.at[idx, "JoiningDate"] if "JoiningDate" in out_df.columns else None
+        j_date = _roll_parse_date(j_raw)
+        e_name = str(out_df.at[idx, "Name"]).strip() if "Name" in out_df.columns else ""
+        emp_bdowns = _get_pen_leaves_index().get(e_name, ()) if e_name else ()
+        row_rolled = False
 
         for step_year in range(row_fy_year, target_start_year):
+            if j_date is not None and date(step_year + 1, 3, 31) < j_date:
+                continue
+            row_rolled = True
             rolled_from_fys.add(f"FY {step_year}-{step_year + 1}")
             o_cl_prev = _safe_num(out_df.at[idx, "Opening_CL"])
             a_cl_prev = _safe_num(out_df.at[idx, "Addition_CL"])
@@ -1524,11 +1826,10 @@ def process_auto_fy_rollover_df(staff_df, as_of_date=None, leave_df=None, rules_
             curr_eff_prev = _safe_num(out_df.at[idx, curr_eff_col])
             cum_eff_prev = _safe_num(out_df.at[idx, cum_eff_col])
 
-            # Inspect active approved leaves in LeaveRequests spanning step_year and new_fy_year
+            # Inspect pre-indexed approved leaves spanning step_year and new_fy_year
             new_fy_year = step_year + 1
             step_eval_date = eval_today if (step_year + 1 == target_start_year) else date(step_year + 1, 4, 1)
             days_in_new_fy = (date(new_fy_year + 1, 3, 31) - date(new_fy_year, 4, 1)).days + 1
-            e_name = str(out_df.at[idx, "Name"]).strip() if "Name" in out_df.columns else ""
             step_fy_ul = 0.0
             step_fy_eff = 0.0
             unpart_step_ul = 0.0
@@ -1536,86 +1837,43 @@ def process_auto_fy_rollover_df(staff_df, as_of_date=None, leave_df=None, rules_
             new_fy_ul = 0.0
             new_fy_eff = 0.0
             new_fy_elapsed_pen = 0.0
-            effective_leave_df = leave_df
-            if effective_leave_df is None:
-                try:
-                    effective_leave_df = load_leave_requests()
-                except Exception:
-                    effective_leave_df = None
 
-            breakdown_func = globals().get("get_leave_fy_breakdown")
-            if breakdown_func is None:
-                def breakdown_func(s_d, e_d, t_d=None):
-                    if s_d is None or e_d is None: return {}
-                    try:
-                        s_d = pd.to_datetime(s_d).date() if not isinstance(s_d, date) else s_d
-                        e_d = pd.to_datetime(e_d).date() if not isinstance(e_d, date) else e_d
-                    except Exception: return {}
-                    if s_d > e_d: return {}
-                    tot_cal = (e_d - s_d).days + 1
-                    if tot_cal <= 0: return {}
-                    s_yr = s_d.year if s_d.month >= 4 else s_d.year - 1
-                    e_yr = e_d.year if e_d.month >= 4 else e_d.year - 1
-                    from collections import OrderedDict
-                    res = OrderedDict()
-                    for y in range(s_yr, e_yr + 1):
-                        c_s = max(s_d, date(y, 4, 1))
-                        c_e = min(e_d, date(y + 1, 3, 31))
-                        c_cal = max(0, (c_e - c_s).days + 1)
-                        d = float(t_d) * (float(c_cal) / float(tot_cal)) if t_d is not None else float(c_cal)
-                        res[y] = {"fy_year": y, "fy_label": f"FY {y}-{y + 1}", "seg_start": c_s, "seg_end": c_e, "days": round(d, 2)}
-                    return res
-
-            if effective_leave_df is not None and not effective_leave_df.empty and e_name:
+            for l_is_ul, l_is_eff, bdown in emp_bdowns:
                 try:
-                    emp_pen_leaves = effective_leave_df[
-                        (effective_leave_df["Name"].astype(str).str.strip() == e_name) &
-                        (effective_leave_df["Status"].astype(str).str.strip() == "Approved")
-                    ]
-                    for _, l_row in emp_pen_leaves.iterrows():
-                        l_t = str(l_row.get("LeaveType", "")).strip()
-                        base_lt = l_t.replace("Return-", "").replace("Rev-", "").strip()
-                        l_is_ul = l_t in ["UL", "Return-UL"]
-                        rule_eff = bool(_lt_rules.get(base_lt, {}).get("Affects_Service_Year", False)) if not l_is_ul else False
-                        l_is_eff = False if l_is_ul else ((str(l_row.get("EffectsServiceYear", "")).strip().lower() == "yes") or rule_eff)
-                        if not (l_is_ul or l_is_eff):
-                            continue
-                        l_s = l_row.get("StartDate")
-                        l_e = l_row.get("EndDate")
-                        l_d = float(l_row.get("TotalDays", 0.0))
-                        bdown = breakdown_func(l_s, l_e, l_d)
-                        if step_year in bdown:
-                            step_seg_d = float(bdown[step_year]["days"])
-                            step_and_future_d = sum(float(v["days"]) for y, v in bdown.items() if y >= step_year)
-                            if l_is_ul:
-                                step_fy_ul += step_seg_d
-                                unpart_step_ul += step_and_future_d
-                            if l_is_eff:
-                                step_fy_eff += step_seg_d
-                                unpart_step_eff += step_and_future_d
-                        if new_fy_year in bdown:
-                            new_seg_info = bdown[new_fy_year]
-                            seg_d = float(new_seg_info["days"])
-                            if l_is_ul:
-                                new_fy_ul += seg_d
-                            if l_is_eff:
-                                new_fy_eff += seg_d
-                            pen_applies = (l_is_ul and ul_affects_svc) or l_is_eff
-                            if pen_applies:
-                                if not service_freeze:
+                    if step_year in bdown:
+                        step_seg_d = float(bdown[step_year]["days"])
+                        step_and_future_d = sum(float(v["days"]) for y, v in bdown.items() if y >= step_year)
+                        if l_is_ul:
+                            step_fy_ul += step_seg_d
+                            unpart_step_ul += step_and_future_d
+                        if l_is_eff:
+                            step_fy_eff += step_seg_d
+                            unpart_step_eff += step_and_future_d
+                    if new_fy_year in bdown:
+                        new_seg_info = bdown[new_fy_year]
+                        seg_d = float(new_seg_info["days"])
+                        if l_is_ul:
+                            new_fy_ul += seg_d
+                        if l_is_eff:
+                            new_fy_eff += seg_d
+                        pen_applies = (l_is_ul and ul_affects_svc) or l_is_eff
+                        if pen_applies:
+                            if not service_freeze:
+                                new_fy_elapsed_pen += seg_d
+                            else:
+                                n_s = new_seg_info["seg_start"]
+                                n_e = new_seg_info["seg_end"]
+                                if step_eval_date < n_s:
+                                    continue
+                                elif step_eval_date >= n_e:
                                     new_fy_elapsed_pen += seg_d
-                                elif step_eval_date > date(new_fy_year, 4, 1):
-                                    n_s = new_seg_info["seg_start"]
-                                    n_e = new_seg_info["seg_end"]
-                                    if step_eval_date >= n_e:
-                                        new_fy_elapsed_pen += seg_d
-                                    elif step_eval_date >= n_s:
-                                        seg_cal = max(1, (n_e - n_s).days + 1)
-                                        el_cal = max(0, (step_eval_date - n_s).days + 1)
-                                        sc_d = seg_d * (float(el_cal) / float(seg_cal))
-                                        new_fy_elapsed_pen += (min(seg_d, sc_d) if seg_d >= 0 else max(seg_d, sc_d))
+                                else:
+                                    seg_cal = max(1, (n_e - n_s).days + 1)
+                                    el_cal = max(0, (step_eval_date - n_s).days + 1)
+                                    sc_d = seg_d * (float(el_cal) / float(seg_cal))
+                                    new_fy_elapsed_pen += (min(seg_d, sc_d) if seg_d >= 0 else max(seg_d, sc_d))
                 except Exception:
-                    pass
+                    continue
 
             # Reconcile ending-FY Used_UL / Service-Affecting counters if stamped with unpartitioned multi-FY totals
             # or if LeaveRequests had approved step_year UL not yet reflected in Used_UL
@@ -1705,11 +1963,8 @@ def process_auto_fy_rollover_df(staff_df, as_of_date=None, leave_df=None, rules_
 
             # 3. Recompute Calendar & Actual Service Year and grant UL milestones
             ul_addition = ul_annual_quota
-            j_raw = out_df.at[idx, "JoiningDate"] if "JoiningDate" in out_df.columns else None
-            j_str = str(j_raw).strip() if j_raw is not None else ""
-            if j_str and j_str.lower() not in ("nan", "none", "nat", ""):
+            if j_date is not None:
                 try:
-                    j_date = pd.to_datetime(j_str).date()
                     cal_days = max(0, (step_eval_date - j_date).days)
                     cal_years = round(cal_days / 365.25, 2)
                     actual_days = max(0, cal_days - (new_service_penalty + max(0.0, new_fy_elapsed_pen)))
@@ -1735,6 +1990,29 @@ def process_auto_fy_rollover_df(staff_df, as_of_date=None, leave_df=None, rules_
             out_df.at[idx, "Balance_SL"] = new_b_sl
             out_df.at[idx, "Balance_AL"] = new_b_al
             out_df.at[idx, "Balance_UL"] = max(0.0, opening_ul_new + ul_addition - max(0.0, new_fy_ul))
+
+        if row_rolled:
+            rolled_over = True
+            needs_write = True
+            rolled_count += 1
+        else:
+            needs_write = True
+            seeded = True
+            if j_date is not None:
+                try:
+                    cal_days = max(0, (eval_today - j_date).days)
+                    cal_years = round(cal_days / 365.25, 2)
+                    cum_ul_v = _safe_num(out_df.at[idx, "Cumulative_UL"])
+                    u_ul_v = _safe_num(out_df.at[idx, "Used_UL"])
+                    cum_eff_v = _safe_num(out_df.at[idx, cum_eff_col])
+                    curr_eff_v = _safe_num(out_df.at[idx, curr_eff_col])
+                    pen_v = (max(0.0, cum_ul_v + u_ul_v) if ul_affects_svc else 0.0) + max(0.0, cum_eff_v + curr_eff_v)
+                    actual_days = max(0, cal_days - pen_v)
+                    out_df.at[idx, "Service Year"] = cal_years
+                    out_df.at[idx, "Service Year Penalty"] = pen_v
+                    out_df.at[idx, "Actual Service Year"] = round(actual_days / 365.25, 2)
+                except Exception:
+                    pass
 
         out_df.at[idx, "Active_FY"] = target_fy
 
@@ -1764,6 +2042,9 @@ AUDIT_LOG_COLUMNS = [
     "Timestamp", "Adjuster", "Employee", "Category",
     "Old_Value", "New_Value", "Net_Delta", "Reason"
 ]
+AUDIT_LOG_MAX_ROWS = 2000
+AUDIT_LOG_ROLLOVER_KEEP_ROWS = 1000
+AUDIT_LOG_RETAIN_DAYS = 90
 
 
 def apply_staff_balance_correction(
@@ -1889,14 +2170,10 @@ def apply_staff_balance_correction(
 
 
 @st.cache_data(ttl=30)
-def load_audit_log(conn_override=None):
-    """
-    Loads balance adjustment audit logs from the persistent AuditLog worksheet in Google Sheets.
-    Returns an empty DataFrame with AUDIT_LOG_COLUMNS schema if missing or empty.
-    """
-    active_conn = conn_override if conn_override is not None else conn
+def _load_audit_log_cached():
+    _gs_read = globals().get("_gsheets_read")
     try:
-        df = active_conn.read(worksheet="AuditLog")
+        df = _gs_read(conn, "AuditLog") if callable(_gs_read) else conn.read(worksheet="AuditLog")
         if df is None or df.empty:
             return pd.DataFrame(columns=AUDIT_LOG_COLUMNS)
         for c in AUDIT_LOG_COLUMNS:
@@ -1905,6 +2182,33 @@ def load_audit_log(conn_override=None):
         return df[AUDIT_LOG_COLUMNS]
     except Exception:
         return pd.DataFrame(columns=AUDIT_LOG_COLUMNS)
+
+
+def load_audit_log(_conn_override=None, conn_override=None):
+    """
+    Loads balance adjustment audit logs from the persistent AuditLog worksheet in Google Sheets.
+    Returns an empty DataFrame with AUDIT_LOG_COLUMNS schema if missing or empty.
+    """
+    effective_conn = _conn_override if _conn_override is not None else conn_override
+    if effective_conn is None:
+        cached_fn = globals().get("_load_audit_log_cached")
+        if callable(cached_fn):
+            return cached_fn()
+    active_conn = effective_conn if effective_conn is not None else conn
+    try:
+        _gs_read = globals().get("_gsheets_read")
+        df = _gs_read(active_conn, "AuditLog") if callable(_gs_read) else active_conn.read(worksheet="AuditLog")
+        if df is None or df.empty:
+            return pd.DataFrame(columns=AUDIT_LOG_COLUMNS)
+        for c in AUDIT_LOG_COLUMNS:
+            if c not in df.columns:
+                df[c] = None
+        return df[AUDIT_LOG_COLUMNS]
+    except Exception:
+        return pd.DataFrame(columns=AUDIT_LOG_COLUMNS)
+
+
+load_audit_log.clear = _load_audit_log_cached.clear
 
 
 def record_balance_audit_log(
@@ -1940,9 +2244,11 @@ def record_balance_audit_log(
     new_row_df = pd.DataFrame([entry])
 
     active_conn = conn_override if conn_override is not None else conn
+    _gs_read = globals().get("_gsheets_read")
+    _retry_fn = globals().get("_gsheets_retry")
     existing_df = None
     try:
-        existing_df = active_conn.read(worksheet="AuditLog")
+        existing_df = _gs_read(active_conn, "AuditLog") if callable(_gs_read) else active_conn.read(worksheet="AuditLog")
     except Exception:
         existing_df = None
 
@@ -1956,22 +2262,61 @@ def record_balance_audit_log(
             updated_df[c] = None
     updated_df = updated_df[AUDIT_LOG_COLUMNS]
 
+    max_rows = globals().get("AUDIT_LOG_MAX_ROWS", 2000)
+    was_trimmed = False
+    if len(updated_df) > max_rows:
+        updated_df = updated_df.tail(max_rows).reset_index(drop=True)
+        was_trimmed = True
+
+    ws = None
     try:
         if hasattr(active_conn, "client") and hasattr(active_conn.client, "_open_spreadsheet"):
-            spread = active_conn.client._open_spreadsheet(spreadsheet=None, folder_id=None)
+            spread = _retry_fn(active_conn.client._open_spreadsheet, spreadsheet=None, folder_id=None) if callable(_retry_fn) else active_conn.client._open_spreadsheet(spreadsheet=None, folder_id=None)
             if spread is not None:
                 try:
-                    spread.worksheet("AuditLog")
+                    ws = spread.worksheet("AuditLog")
                 except Exception:
-                    spread.add_worksheet(title="AuditLog", rows="2000", cols="10")
+                    ws = spread.add_worksheet(title="AuditLog", rows="2000", cols="10")
     except Exception:
-        pass
+        ws = None
 
     try:
-        active_conn.update(worksheet="AuditLog", data=updated_df)
+        used_append = False
+        if (
+            not was_trimmed
+            and existing_df is not None
+            and not existing_df.empty
+            and ws is not None
+            and getattr(type(ws), "__module__", "").startswith("gspread")
+            and callable(getattr(ws, "append_row", None))
+        ):
+            try:
+                hdr = [str(h).strip() for h in ws.row_values(1)[:len(AUDIT_LOG_COLUMNS)]]
+                if hdr == AUDIT_LOG_COLUMNS:
+                    row_vals = [entry[c] for c in AUDIT_LOG_COLUMNS]
+                    if callable(_retry_fn):
+                        _retry_fn(ws.append_row, row_vals, value_input_option="USER_ENTERED")
+                    else:
+                        ws.append_row(row_vals, value_input_option="USER_ENTERED")
+                    used_append = True
+            except Exception:
+                used_append = False
+
+        if not used_append:
+            if callable(_retry_fn):
+                _retry_fn(active_conn.update, worksheet="AuditLog", data=updated_df)
+            else:
+                active_conn.update(worksheet="AuditLog", data=updated_df)
+
         try:
-            if hasattr(st, "cache_data") and hasattr(st.cache_data, "clear"):
-                st.cache_data.clear()
+            _inv = globals().get("_invalidate_sheet_cache")
+            if callable(_inv):
+                _inv("AuditLog")
+            else:
+                for _fn_n in ("_load_audit_log_cached", "load_audit_log"):
+                    _fn_obj = globals().get(_fn_n)
+                    if callable(getattr(_fn_obj, "clear", None)):
+                        _fn_obj.clear()
         except Exception:
             pass
         return True, updated_df
@@ -2045,18 +2390,272 @@ def append_audit_log(entry, conn_obj=None):
 
 
 
-def ensure_auto_fy_rollover():
+def _parse_cta_date(val):
+    """IST-safe date parser immune to pandas 3.0.2 mixed-format NaT drop and mixed-tz errors."""
+    if val is None:
+        return None
+    try:
+        if pd.isnull(val):
+            return None
+    except Exception:
+        pass
+    if isinstance(val, datetime):
+        if getattr(val, "tzinfo", None) is not None:
+            return val.astimezone(CTA_TZ).date()
+        return val.date()
+    if hasattr(val, "to_pydatetime"):
+        try:
+            if pd.isnull(val):
+                return None
+            ts = val.to_pydatetime()
+            if ts is None:
+                return None
+            if getattr(ts, "tzinfo", None) is not None:
+                return ts.astimezone(CTA_TZ).date()
+            return ts.date()
+        except Exception:
+            return None
+    if isinstance(val, date):
+        return val
+    try:
+        if pd.isnull(val):
+            return None
+    except Exception:
+        pass
+    s = str(val).strip()
+    if not s or s.lower() in {"nan", "none", "nat", "null"}:
+        return None
+    if ("T" in s or s.endswith(("Z", "z")) or ("+" in s[10:] if len(s) > 10 else False) or ("-" in s[10:] and ":" in s[10:] if len(s) > 10 else False)):
+        try:
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00").replace("z", "+00:00"))
+            if dt.tzinfo is not None:
+                return dt.astimezone(CTA_TZ).date()
+            return dt.date()
+        except Exception:
+            pass
+    for fmt in (
+        "%Y-%m-%d",
+        "%Y/%m/%d",
+        "%d-%m-%Y",
+        "%d/%m/%Y",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y/%m/%d %H:%M:%S",
+        "%d-%m-%Y %H:%M:%S",
+        "%d/%m/%Y %H:%M:%S",
+    ):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is not None:
+            return dt.astimezone(CTA_TZ).date()
+        return dt.date()
+    except Exception:
+        pass
+    if len(s) >= 10:
+        for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y", "%d/%m/%Y"):
+            try:
+                return datetime.strptime(s[:10], fmt).date()
+            except ValueError:
+                continue
+    return None
+
+
+def filter_df_for_fy_archive(df, fy_start_year, start_col, end_col):
+    """Returns rows whose [start_col, end_col] overlaps [Apr 1 fy_start_year, Mar 31 fy_start_year+1].
+    Passes through schema-minimal DataFrames lacking both date columns; excludes dateless rows otherwise.
+    """
+    if df is None:
+        return pd.DataFrame()
+    if df.empty or fy_start_year is None:
+        return df.copy()
+    has_start = start_col in df.columns
+    has_end = end_col in df.columns
+    if not has_start and not has_end:
+        return df.copy()
+
+    fy_start = date(int(fy_start_year), 4, 1)
+    fy_end = date(int(fy_start_year) + 1, 3, 31)
+    start_vals = df[start_col].tolist() if has_start else [None] * len(df)
+    end_vals = df[end_col].tolist() if has_end else [None] * len(df)
+
+    keep_mask = []
+    for raw_s, raw_e in zip(start_vals, end_vals):
+        sd = _parse_cta_date(raw_s)
+        ed = _parse_cta_date(raw_e)
+        if sd is None and ed is None:
+            keep_mask.append(False)
+            continue
+        s_d = sd if sd is not None else ed
+        e_d = ed if ed is not None else sd
+        if e_d < s_d:
+            e_d = s_d
+        keep_mask.append(e_d >= fy_start and s_d <= fy_end)
+
+    return df.loc[keep_mask].copy().reset_index(drop=True)
+
+
+def prune_closed_prior_fy_records(df, target_fy_start_year, kind="leave"):
+    """Returns rows to RETAIN in the active sheet after FY rollover.
+    Retains non-terminal statuses, unpunched/unendorsed records, cross-FY/future rows,
+    a 14-day March continuity tail for leaves, and dateless/unparseable/schema-minimal rows.
+    """
+    if df is None:
+        return pd.DataFrame()
+    if df.empty or target_fy_start_year is None:
+        return df.copy()
+
+    new_fy_start = date(int(target_fy_start_year), 4, 1)
+    cols = set(df.columns)
+    kind_norm = str(kind or "leave").strip().lower()
+
+    if kind_norm == "leave":
+        if "StartDate" not in cols and "EndDate" not in cols:
+            return df.copy()
+        leave_continuity_cutoff = new_fy_start - timedelta(days=14)
+        retain_mask = []
+        for _, row in df.iterrows():
+            status = str(row.get("Status", "")).strip()
+            status_low = status.lower()
+            if status_low not in {"approved", "rejected", "cancelled"}:
+                retain_mask.append(True)
+                continue
+            if status_low == "approved" and "AccountsPunched" in cols:
+                ap_val = row.get("AccountsPunched")
+                if pd.isna(ap_val) or ap_val == "" or str(ap_val).strip().lower() in {"", "false", "no", "0", "nan", "none", "pending"}:
+                    retain_mask.append(True)
+                    continue
+            if status_low in {"pending", "approved"} and "SelectedCoAdmin" in cols:
+                sel_co = str(row.get("SelectedCoAdmin", "")).strip()
+                if sel_co and sel_co.lower() not in {"", "nan", "none", "n/a", "not-applicable"}:
+                    if "CoAdminAcknowledged" not in cols:
+                        retain_mask.append(True)
+                        continue
+                    co_ack = row.get("CoAdminAcknowledged")
+                    co_ack_s = "" if pd.isna(co_ack) else str(co_ack).strip().lower()
+                    if co_ack_s in {"", "nan", "none", "no", "pending", "false", "0"}:
+                        retain_mask.append(True)
+                        continue
+            sd = _parse_cta_date(row.get("StartDate")) if "StartDate" in cols else None
+            ed = _parse_cta_date(row.get("EndDate")) if "EndDate" in cols else None
+            eff_end = ed if ed is not None else sd
+            if sd is not None and eff_end is not None and eff_end < sd:
+                eff_end = sd
+            if eff_end is None or eff_end >= leave_continuity_cutoff:
+                retain_mask.append(True)
+                continue
+            retain_mask.append(False)
+        return df.loc[retain_mask].copy().reset_index(drop=True)
+
+    # kind == "tour"
+    if "DepartureDate" not in cols and "ArrivalDate" not in cols:
+        return df.copy()
+    retain_mask = []
+    for _, row in df.iterrows():
+        status = str(row.get("Status", "")).strip()
+        status_low = status.lower()
+        if status_low not in {"sanctioned", "completed", "settled", "rejected", "cancelled"}:
+            retain_mask.append(True)
+            continue
+        if status_low in {"sanctioned", "completed", "settled"}:
+            punched = str(row.get("AccountsPunched", "")).strip().lower() if "AccountsPunched" in cols else ""
+            if punched not in {"yes", "punched"}:
+                retain_mask.append(True)
+                continue
+        dd = _parse_cta_date(row.get("DepartureDate")) if "DepartureDate" in cols else None
+        ad = _parse_cta_date(row.get("ArrivalDate")) if "ArrivalDate" in cols else None
+        eff_end = ad if ad is not None else dd
+        if dd is not None and eff_end is not None and eff_end < dd:
+            eff_end = dd
+        if eff_end is None or eff_end >= new_fy_start:
+            retain_mask.append(True)
+            continue
+        retain_mask.append(False)
+    return df.loc[retain_mask].copy().reset_index(drop=True)
+
+
+def _worksheet_has_data(ws, active_conn=None, sheet_name=None):
+    """Returns True if an existing Google Sheets worksheet already has >=1 non-empty data row below header."""
+    vals = None
+    try:
+        vals = _gsheets_retry(ws.get, "A1:AD2")
+    except (AttributeError, NotImplementedError, TypeError):
+        vals = None
+    if not isinstance(vals, (list, tuple)):
+        try:
+            vals = ws.get_all_values()
+        except (AttributeError, NotImplementedError, TypeError):
+            vals = None
+    if isinstance(vals, (list, tuple)):
+        if len(vals) < 2:
+            return False
+        for row in vals[1:]:
+            cells = row if isinstance(row, (list, tuple)) else [row]
+            if any(str(c).strip() != "" for c in cells):
+                return True
+        return False
+    if active_conn is not None and sheet_name:
+        try:
+            existing_df = _gsheets_read(active_conn, sheet_name)
+            return existing_df is not None and not existing_df.empty
+        except Exception:
+            return False
+    return False
+
+
+def ensure_auto_fy_rollover(conn_override=None, today_override=None):
     """
     Runs automatically on dashboard entry. Fast-exits in memory when Staff_Master is already on
     the current IST Financial Year. Acquires a process lock only if initial Active_FY seeding or
     an automatic March 31 midnight IST rollover is required.
     """
+    active_conn = conn_override if conn_override is not None else conn
+    _gs_read = globals().get("_gsheets_read")
+    _retry_fn = globals().get("_gsheets_retry")
+
+    def _read_sheet(ws_name):
+        if callable(_gs_read):
+            return _gs_read(active_conn, ws_name)
+        try:
+            return active_conn.read(worksheet=ws_name, ttl=0)
+        except TypeError as te:
+            if "ttl" in str(te):
+                return active_conn.read(worksheet=ws_name)
+            raise
+
+    def _retry_call(fn, *a, **kw):
+        if callable(_retry_fn):
+            return _retry_fn(fn, *a, **kw)
+        return fn(*a, **kw)
+
+    def _inv_data_caches():
+        _inv = globals().get("_invalidate_all_data_caches")
+        if callable(_inv):
+            _inv()
+            return
+        for _fn_n in (
+            "load_users_data", "load_staff_master", "_read_leave_rules_sheet",
+            "_load_audit_log_cached", "load_audit_log", "load_leave_requests",
+            "load_tour_sanctions", "_list_spreadsheet_sheet_titles",
+        ):
+            _fn_obj = globals().get(_fn_n)
+            if callable(getattr(_fn_obj, "clear", None)):
+                try:
+                    _fn_obj.clear()
+                except Exception:
+                    pass
+
     try:
-        staff_df = load_staff_master()
+        if conn_override is None:
+            staff_df = load_staff_master()
+        else:
+            staff_df = _read_sheet("Staff_Master")
         if staff_df is None or staff_df.empty:
             return None
 
-        eval_today = get_cta_today()
+        eval_today = today_override if today_override is not None else get_cta_today()
         fy_start, _, _ = get_current_financial_year_dates(eval_today)
         target_start_year = fy_start.year
 
@@ -2066,8 +2665,8 @@ def ensure_auto_fy_rollover():
                 return None
 
         with _AUTO_ROLLOVER_LOCK:
-            st.cache_data.clear()
-            fresh_staff_df = conn.read(worksheet="Staff_Master")
+            _inv_data_caches()
+            fresh_staff_df = _read_sheet("Staff_Master")
             if fresh_staff_df is None or fresh_staff_df.empty:
                 return None
             if "Branch" not in fresh_staff_df.columns:
@@ -2079,14 +2678,14 @@ def ensure_auto_fy_rollover():
             active_rules = None
             if callable(_load_rules_fn):
                 try:
-                    active_rules = _load_rules_fn(conn_override=conn, force_refresh=True)
+                    active_rules = _load_rules_fn(conn_override=active_conn, force_refresh=True)
                 except TypeError:
-                    active_rules = _load_rules_fn(conn_override=conn)
+                    active_rules = _load_rules_fn(conn_override=active_conn)
                 except Exception:
                     active_rules = None
 
             try:
-                df_req_fresh = conn.read(worksheet="LeaveRequests")
+                df_req_fresh = _read_sheet("LeaveRequests")
             except Exception as req_ex:
                 # Fail safely rather than silently rolling forward with an empty LeaveRequests DataFrame
                 # (which would miss multi-FY UL leaves). Next visit retries cleanly.
@@ -2132,56 +2731,105 @@ def ensure_auto_fy_rollover():
                 )
 
             archive_errors = []
+            df_tour_fresh = None
             # Archive LeaveRequests and TourSanctions snapshots BEFORE committing Staff_Master
-            # so transient archive failures are visible and never silently skipped by fast-exit.
+            # so transient archive failures block Staff_Master advancement and retry cleanly next load.
             if info.get("rolled_over"):
                 try:
-                    df_tour_fresh = conn.read(worksheet="TourSanctions")
+                    df_tour_fresh = _read_sheet("TourSanctions")
                 except Exception as tour_read_ex:
                     df_tour_fresh = None
                     archive_errors.append(f"TourSanctions read failed before archive: {tour_read_ex}")
 
+                _filter_arch = globals().get("filter_df_for_fy_archive")
+                _has_data_fn = globals().get("_worksheet_has_data")
+
+                archive_plan = []
                 for ended_fy in info.get("rolled_from_fys", []):
                     clean_fy = ended_fy.replace(" ", "").replace("/", "_")
-                    spread = None
+                    fy_yr = parse_fy_start_year(ended_fy)
+                    req_fy_df = (
+                        _filter_arch(df_req_fresh, fy_yr, "StartDate", "EndDate")
+                        if callable(_filter_arch)
+                        else (df_req_fresh.copy() if df_req_fresh is not None else pd.DataFrame())
+                    )
+                    tour_fy_df = (
+                        _filter_arch(df_tour_fresh, fy_yr, "DepartureDate", "ArrivalDate")
+                        if callable(_filter_arch)
+                        else (df_tour_fresh.copy() if df_tour_fresh is not None else pd.DataFrame())
+                    )
+                    archive_plan.append((ended_fy, clean_fy, req_fy_df, tour_fy_df))
+
+                needs_archive_write = any(
+                    (r_df is not None and not r_df.empty) or (t_df is not None and not t_df.empty)
+                    for _, _, r_df, t_df in archive_plan
+                )
+
+                spread = None
+                if needs_archive_write:
                     try:
-                        spread = conn.client._open_spreadsheet(spreadsheet=None, folder_id=None)
+                        spread = _retry_call(active_conn.client._open_spreadsheet, spreadsheet=None, folder_id=None)
                     except Exception as open_ex:
                         spread = None
-                        archive_errors.append(f"Archive spreadsheet open warning for {ended_fy}: {open_ex}")
+                        archive_errors.append(f"Archive spreadsheet open failed: {open_ex}")
 
-                    # 1. LeaveRequests Archive
-                    if df_req_fresh is not None and not df_req_fresh.empty and spread is not None:
-                        archive_sheet = f"LeaveRequests_Archive_{clean_fy}"
+                def _write_archive_tab(sheet_title, df_slice, cols_count):
+                    if df_slice is None or df_slice.empty:
+                        return
+                    if spread is None:
+                        archive_errors.append(f"Archive skipped for {sheet_title}: spreadsheet handle unavailable")
+                        return
+                    try:
+                        ws_existing = None
                         try:
-                            try:
-                                spread.worksheet(archive_sheet)
-                            except Exception:
-                                spread.add_worksheet(title=archive_sheet, rows="1000", cols="25")
-                            conn.update(worksheet=archive_sheet, data=df_req_fresh)
-                        except Exception as lr_arch_ex:
-                            archive_errors.append(f"Archive write failed for {archive_sheet}: {lr_arch_ex}")
+                            ws_existing = spread.worksheet(sheet_title)
+                        except Exception as ws_ex:
+                            ws_msg = str(ws_ex).lower()
+                            ws_cls = type(ws_ex).__name__.lower()
+                            if (
+                                "not found" in ws_msg
+                                or "worksheetnotfound" in ws_msg
+                                or "worksheetnotfound" in ws_cls
+                                or (
+                                    "403" not in ws_msg
+                                    and "429" not in ws_msg
+                                    and "500" not in ws_msg
+                                    and "502" not in ws_msg
+                                    and "503" not in ws_msg
+                                    and "504" not in ws_msg
+                                    and "timeout" not in ws_msg
+                                    and "permission" not in ws_msg
+                                )
+                            ):
+                                ws_existing = None
+                            else:
+                                raise
+                        if ws_existing is not None:
+                            already_populated = (
+                                _has_data_fn(ws_existing, active_conn=active_conn, sheet_name=sheet_title)
+                                if callable(_has_data_fn)
+                                else False
+                            )
+                            if already_populated:
+                                return
+                        else:
+                            spread.add_worksheet(title=sheet_title, rows="1000", cols=cols_count)
+                        _retry_call(active_conn.update, worksheet=sheet_title, data=df_slice)
+                    except Exception as arch_ex:
+                        archive_errors.append(f"Archive write failed for {sheet_title}: {arch_ex}")
 
-                    # 2. TourSanctions Archive
-                    if df_tour_fresh is not None and not df_tour_fresh.empty and spread is not None:
-                        archive_tour_sheet = f"TourSanctions_Archive_{clean_fy}"
-                        try:
-                            try:
-                                spread.worksheet(archive_tour_sheet)
-                            except Exception:
-                                spread.add_worksheet(title=archive_tour_sheet, rows="1000", cols="30")
-                            conn.update(worksheet=archive_tour_sheet, data=df_tour_fresh)
-                        except Exception as tr_arch_ex:
-                            archive_errors.append(f"Archive write failed for {archive_tour_sheet}: {tr_arch_ex}")
+                for _, clean_fy, req_fy_df, tour_fy_df in archive_plan:
+                    _write_archive_tab(f"LeaveRequests_Archive_{clean_fy}", req_fy_df, "25")
+                    _write_archive_tab(f"TourSanctions_Archive_{clean_fy}", tour_fy_df, "30")
 
                 # Concurrent cloud container guard: verify Staff_Master wasn't already rolled over
                 # by another Streamlit Cloud container while archives were being written.
                 try:
-                    recheck_df = conn.read(worksheet="Staff_Master")
+                    recheck_df = _read_sheet("Staff_Master")
                     if recheck_df is not None and not recheck_df.empty and "Active_FY" in recheck_df.columns:
                         recheck_years = [parse_fy_start_year(v) for v in recheck_df["Active_FY"].tolist()]
                         if all(y == target_start_year for y in recheck_years):
-                            st.cache_data.clear()
+                            _inv_data_caches()
                             return {
                                 "needs_write": False,
                                 "seeded": False,
@@ -2193,21 +2841,107 @@ def ensure_auto_fy_rollover():
                 except Exception:
                     pass
 
-            conn.update(worksheet="Staff_Master", data=synced_df)
-            if archive_errors:
-                info["archive_errors"] = archive_errors
-                try:
-                    st.session_state["_last_rollover_error"] = " | ".join(archive_errors)
-                except Exception:
-                    pass
-            else:
-                try:
-                    if isinstance(st.session_state, dict):
-                        st.session_state.pop("_last_rollover_error", None)
-                except Exception:
-                    pass
+                if archive_errors:
+                    try:
+                        st.session_state["_last_rollover_error"] = " | ".join(archive_errors)
+                    except Exception:
+                        pass
+                    _inv_data_caches()
+                    return {
+                        **info,
+                        "needs_write": False,
+                        "rolled_over": False,
+                        "committed": False,
+                        "archive_errors": archive_errors,
+                    }
 
-            st.cache_data.clear()
+            _retry_call(active_conn.update, worksheet="Staff_Master", data=synced_df)
+            try:
+                if isinstance(st.session_state, dict):
+                    st.session_state.pop("_last_rollover_error", None)
+            except Exception:
+                pass
+
+            # Feature 5: Safe active-sheet pruning & AuditLog rollover bounding (ONLY after commit succeeds)
+            if info.get("rolled_over") and not archive_errors:
+                prune_errors = []
+                _prune_fn = globals().get("prune_closed_prior_fy_records")
+                if callable(_prune_fn):
+                    try:
+                        if df_req_fresh is not None and not df_req_fresh.empty:
+                            pruned_req = _prune_fn(df_req_fresh, target_start_year, kind="leave")
+                            if len(pruned_req) < len(df_req_fresh):
+                                _retry_call(active_conn.update, worksheet="LeaveRequests", data=pruned_req)
+                    except Exception as pr_req_ex:
+                        prune_errors.append(f"LeaveRequests prune warning: {pr_req_ex}")
+
+                    try:
+                        if df_tour_fresh is not None and not df_tour_fresh.empty:
+                            pruned_tour = _prune_fn(df_tour_fresh, target_start_year, kind="tour")
+                            if len(pruned_tour) < len(df_tour_fresh):
+                                _retry_call(active_conn.update, worksheet="TourSanctions", data=pruned_tour)
+                    except Exception as pr_tour_ex:
+                        prune_errors.append(f"TourSanctions prune warning: {pr_tour_ex}")
+
+                # Non-fatal AuditLog rollover archiving/trimming
+                try:
+                    audit_keep_rows = globals().get("AUDIT_LOG_ROLLOVER_KEEP_ROWS", 1000)
+                    audit_max_rows = globals().get("AUDIT_LOG_MAX_ROWS", 2000)
+                    audit_retain_days = globals().get("AUDIT_LOG_RETAIN_DAYS", 90)
+                    audit_df = _read_sheet("AuditLog")
+                    if audit_df is not None and not audit_df.empty and len(audit_df) > audit_keep_rows:
+                        _parse_d_fn = globals().get("_parse_cta_date")
+                        cutoff_d = date(int(target_start_year), 4, 1) - timedelta(days=audit_retain_days)
+                        old_indices = []
+                        keep_indices = []
+                        if callable(_parse_d_fn) and "Timestamp" in audit_df.columns:
+                            ts_fast = pd.to_datetime(audit_df["Timestamp"], format="%Y-%m-%d %H:%M:%S", errors="coerce").dt.date
+                            for a_idx, raw_ts, f_d in zip(audit_df.index, audit_df["Timestamp"].tolist(), ts_fast.tolist()):
+                                ts_d = f_d if (f_d is not None and not pd.isna(f_d)) else _parse_d_fn(raw_ts)
+                                if ts_d is not None and ts_d < cutoff_d:
+                                    old_indices.append(a_idx)
+                                else:
+                                    keep_indices.append(a_idx)
+                        else:
+                            keep_indices = list(audit_df.index)
+
+                        if len(keep_indices) > audit_max_rows:
+                            overflow_count = len(keep_indices) - audit_keep_rows
+                            old_indices.extend(keep_indices[:overflow_count])
+                            keep_indices = keep_indices[overflow_count:]
+                        elif not old_indices and len(audit_df) > audit_keep_rows:
+                            split_at = len(audit_df) - audit_keep_rows
+                            old_indices = list(audit_df.index[:split_at])
+                            keep_indices = list(audit_df.index[split_at:])
+
+                        if old_indices:
+                            old_audit_df = audit_df.loc[old_indices].copy().reset_index(drop=True)
+                            keep_audit_df = audit_df.loc[keep_indices].copy().reset_index(drop=True)
+                            rolled_fys = info.get("rolled_from_fys", [])
+                            last_clean_fy = rolled_fys[-1].replace(" ", "").replace("/", "_") if rolled_fys else f"FY{target_start_year - 1}-{target_start_year}"
+                            audit_arch_title = f"AuditLog_Archive_{last_clean_fy}"
+                            if hasattr(active_conn, "client") and hasattr(active_conn.client, "_open_spreadsheet"):
+                                a_spread = _retry_call(active_conn.client._open_spreadsheet, spreadsheet=None, folder_id=None)
+                                if a_spread is not None:
+                                    a_ws = None
+                                    try:
+                                        a_ws = a_spread.worksheet(audit_arch_title)
+                                    except Exception:
+                                        a_ws = None
+                                    if a_ws is None:
+                                        a_spread.add_worksheet(title=audit_arch_title, rows="2000", cols="10")
+                                        _retry_call(active_conn.update, worksheet=audit_arch_title, data=old_audit_df)
+                                    elif callable(globals().get("_worksheet_has_data")) and not globals()["_worksheet_has_data"](a_ws, active_conn=active_conn, sheet_name=audit_arch_title):
+                                        _retry_call(active_conn.update, worksheet=audit_arch_title, data=old_audit_df)
+                            _retry_call(active_conn.update, worksheet="AuditLog", data=keep_audit_df)
+                except Exception as audit_ex:
+                    prune_errors.append(f"AuditLog trim warning: {audit_ex}")
+
+                if prune_errors:
+                    info["prune_errors"] = prune_errors
+
+            info["committed"] = True
+            _inv_data_caches()
             return info
     except Exception as ex:
         try:
@@ -2220,7 +2954,7 @@ def ensure_auto_fy_rollover():
 @st.cache_data(ttl=60)
 def load_leave_requests():
     try:
-        df = conn.read(worksheet="LeaveRequests")
+        df = _gsheets_read(conn, "LeaveRequests")
         # Prevent TypeError when assigning strings to newly created empty columns that pandas read as float64
         for col in ["SupportedBy", "ApprovedBy", "PunchedBy", "SelectedCoAdmin", "SelectedAdmin", "Department", "Status", "CoAdminAcknowledged", "AccountsPunched", "Reason", "StartHalf", "EndHalf", "ApplicationDate"]:
             if col in df.columns:
@@ -2235,7 +2969,7 @@ def load_leave_requests():
 @st.cache_data(ttl=30)
 def load_tour_sanctions():
     try:
-        df = conn.read(worksheet="TourSanctions")
+        df = _gsheets_read(conn, "TourSanctions")
         if df is None:
             df = pd.DataFrame()
         obsolete_cols = [
@@ -2302,7 +3036,10 @@ MAX_CONSECUTIVE_CL_DAYS = 5.0
 
 
 def _parse_leave_date(val):
-    """Parse a date/datetime/Timestamp/string into datetime.date or return None."""
+    """Parse a date/datetime/Timestamp/string into datetime.date or return None (IST-safe)."""
+    _cta_fn = globals().get("_parse_cta_date")
+    if callable(_cta_fn):
+        return _cta_fn(val)
     if val is None or (isinstance(val, float) and pd.isna(val)):
         return None
     if isinstance(val, datetime):
@@ -2316,9 +3053,9 @@ def _parse_leave_date(val):
     if isinstance(val, date):
         return val
     s = str(val).strip()
-    if not s or s.lower() == "nan":
+    if not s or s.lower() in ("nan", "none", "nat", "null"):
         return None
-    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y"):
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y", "%d/%m/%Y"):
         try:
             return datetime.strptime(s[:10], fmt).date()
         except ValueError:
@@ -2447,13 +3184,15 @@ def get_effective_leave_balances(user_name, raw_balances, df_requests, rules_ove
 
     if df_requests is not None and not df_requests.empty and "Name" in df_requests.columns:
         target_name = str(user_name).strip()
-        user_rows = df_requests[df_requests["Name"].astype(str).str.strip() == target_name]
-        for _, row in user_rows.iterrows():
-            if str(row.get("Status", "")).strip() != "Pending":
+        n_rows = len(df_requests)
+        names_l = df_requests["Name"].tolist()
+        status_l = df_requests["Status"].tolist() if "Status" in df_requests.columns else [""] * n_rows
+        lt_l = df_requests["LeaveType"].tolist() if "LeaveType" in df_requests.columns else [""] * n_rows
+        td_l = df_requests["TotalDays"].tolist() if "TotalDays" in df_requests.columns else [0.0] * n_rows
+        for nm_v, st_v, lt_v, td_v in zip(names_l, status_l, lt_l, td_l):
+            if str(nm_v).strip() != target_name or str(st_v).strip() != "Pending":
                 continue
-            base_lt, is_rev, days_abs = _parse_leave_type_info(
-                row.get("LeaveType", ""), row.get("TotalDays", 0.0)
-            )
+            base_lt, is_rev, days_abs = _parse_leave_type_info(lt_v, td_v)
             if base_lt in tracked_types and days_abs > 0:
                 if is_rev:
                     pending_reversed[base_lt] += days_abs
@@ -2482,7 +3221,7 @@ def get_effective_leave_balances(user_name, raw_balances, df_requests, rules_ove
     }
 
 
-def build_user_active_leave_segments(user_name, df_requests):
+def build_user_active_leave_segments(user_name, df_requests, window_start=None, window_end=None):
     """Build active half-day slots and merged same-type contiguous segments for a user.
     Includes Pending & Approved requests and subtracts Approved reversals chronologically.
     Returns (slot_type_map, merged_segments)."""
@@ -2490,27 +3229,77 @@ def build_user_active_leave_segments(user_name, df_requests):
         return {}, []
 
     target_name = str(user_name).strip()
-    user_rows = df_requests[df_requests["Name"].astype(str).str.strip() == target_name]
-    slot_entries = {}
+    names_l = df_requests["Name"].tolist()
+    has_status = "Status" in df_requests.columns
+    if has_status:
+        status_l = df_requests["Status"].tolist()
+        keep_idx = [
+            i for i, (n, s) in enumerate(zip(names_l, status_l))
+            if str(n).strip() == target_name and str(s).strip() in ("Pending", "Approved")
+        ]
+    else:
+        keep_idx = [i for i, n in enumerate(names_l) if str(n).strip() == target_name]
+    if not keep_idx:
+        return {}, []
+    user_rows = df_requests.iloc[keep_idx]
 
-    for _, row in user_rows.iterrows():
-        status = str(row.get("Status", "")).strip()
+    win_s_slot = None
+    win_e_slot = None
+    if window_start is not None and window_end is not None:
+        win_s_slot = window_start.toordinal() * 2
+        win_e_slot = window_end.toordinal() * 2 + 1
+        if "StartDate" in user_rows.columns and "EndDate" in user_rows.columns:
+            s_raw = user_rows["StartDate"].tolist()
+            e_raw = user_rows["EndDate"].tolist()
+            if len(user_rows) > 32:
+                s_fast = pd.to_datetime(user_rows["StartDate"], format="%Y-%m-%d", errors="coerce").dt.date.tolist()
+                e_fast = pd.to_datetime(user_rows["EndDate"], format="%Y-%m-%d", errors="coerce").dt.date.tolist()
+            else:
+                s_fast = [None] * len(s_raw)
+                e_fast = [None] * len(e_raw)
+            keep_w = []
+            for rv_s, sf, rv_e, ef in zip(s_raw, s_fast, e_raw, e_fast):
+                sd = sf if (sf is not None and not pd.isna(sf)) else _parse_leave_date(rv_s)
+                ed = ef if (ef is not None and not pd.isna(ef)) else _parse_leave_date(rv_e)
+                if sd is None or ed is None or sd > ed:
+                    keep_w.append(False)
+                else:
+                    keep_w.append(ed >= window_start and sd <= window_end)
+            user_rows = user_rows.loc[keep_w]
+            if user_rows.empty:
+                return {}, []
+
+    slot_entries = {}
+    n_u = len(user_rows)
+    u_status_l = user_rows["Status"].tolist() if "Status" in user_rows.columns else [""] * n_u
+    u_lt_l = user_rows["LeaveType"].tolist() if "LeaveType" in user_rows.columns else [""] * n_u
+    u_td_l = user_rows["TotalDays"].tolist() if "TotalDays" in user_rows.columns else [0.0] * n_u
+    u_sd_l = user_rows["StartDate"].tolist() if "StartDate" in user_rows.columns else [None] * n_u
+    u_sh_l = user_rows["StartHalf"].tolist() if "StartHalf" in user_rows.columns else [None] * n_u
+    u_ed_l = user_rows["EndDate"].tolist() if "EndDate" in user_rows.columns else [None] * n_u
+    u_eh_l = user_rows["EndHalf"].tolist() if "EndHalf" in user_rows.columns else [None] * n_u
+
+    for st_v, lt_v, td_v, sd_v, sh_v, ed_v, eh_v in zip(u_status_l, u_lt_l, u_td_l, u_sd_l, u_sh_l, u_ed_l, u_eh_l):
+        status = str(st_v).strip()
         if status not in ("Pending", "Approved"):
             continue
-        base_lt, is_rev, _ = _parse_leave_type_info(
-            row.get("LeaveType", ""), row.get("TotalDays", 0.0)
-        )
-        slot_rng = get_leave_slot_range(
-            row.get("StartDate"), row.get("StartHalf"),
-            row.get("EndDate"), row.get("EndHalf"),
-        )
+        base_lt, is_rev, _ = _parse_leave_type_info(lt_v, td_v)
+        slot_rng = get_leave_slot_range(sd_v, sh_v, ed_v, eh_v)
         if slot_rng is None:
             continue
         s_slot, e_slot = slot_rng
+        if win_s_slot is not None:
+            loop_s = max(s_slot, win_s_slot)
+            loop_e = min(e_slot, win_e_slot)
+            if loop_s > loop_e:
+                continue
+        else:
+            loop_s, loop_e = s_slot, e_slot
+
         if is_rev:
             if status != "Approved":
                 continue
-            for s in range(s_slot, e_slot + 1):
+            for s in range(loop_s, loop_e + 1):
                 entries = slot_entries.get(s)
                 if not entries:
                     continue
@@ -2529,7 +3318,7 @@ def build_user_active_leave_segments(user_name, df_requests):
                     if not entries:
                         del slot_entries[s]
         else:
-            for s in range(s_slot, e_slot + 1):
+            for s in range(loop_s, loop_e + 1):
                 slot_entries.setdefault(s, []).append((base_lt, status))
 
     if not slot_entries:
@@ -2602,9 +3391,22 @@ def validate_leave_application(
         active_strict_balance_types = set(RESTRICTED_BALANCE_TYPES)
         active_combo_types = set(RESTRICTED_COMBO_TYPES)
 
+    scoped_requests = df_requests
+    if df_requests is not None and not df_requests.empty and "Name" in df_requests.columns:
+        target_name = str(user_name).strip()
+        names_l = df_requests["Name"].tolist()
+        if "Status" in df_requests.columns:
+            keep_sc = [
+                i for i, (n, s) in enumerate(zip(names_l, df_requests["Status"].tolist()))
+                if str(n).strip() == target_name and str(s).strip() in ("Pending", "Approved")
+            ]
+        else:
+            keep_sc = [i for i, n in enumerate(names_l) if str(n).strip() == target_name]
+        scoped_requests = df_requests.iloc[keep_sc]
+
     hard_blocks = []
     policy_alerts = []
-    eff_bal_info = get_effective_leave_balances(user_name, raw_balances, df_requests, rules_override=rules_override)
+    eff_bal_info = get_effective_leave_balances(user_name, raw_balances, scoped_requests, rules_override=rules_override)
     slot_range = get_leave_slot_range(start_date, start_half, end_date, end_half)
 
     if is_reversal:
@@ -2647,8 +3449,21 @@ def validate_leave_application(
             "new_slot_range": slot_range,
         }
 
+    max_consec_limit = float(
+        _types_cfg.get(lt, {}).get("Max_Consecutive_Days", MAX_CONSECUTIVE_CL_DAYS if lt == "CL" else 0.0)
+    ) if _types_cfg else (MAX_CONSECUTIVE_CL_DAYS if lt == "CL" else 0.0)
+
     new_s, new_e = slot_range
-    slot_type_map, merged_segments = build_user_active_leave_segments(user_name, df_requests)
+    from datetime import date as _win_date, timedelta as _win_td
+    _win_pad = _win_td(days=max(14, int(max_consec_limit) + 7))
+    _win_start = _win_date.fromordinal(new_s // 2) - _win_pad
+    _win_end = _win_date.fromordinal(new_e // 2) + _win_pad
+    try:
+        slot_type_map, merged_segments = build_user_active_leave_segments(
+            user_name, scoped_requests, window_start=_win_start, window_end=_win_end
+        )
+    except TypeError:
+        slot_type_map, merged_segments = build_user_active_leave_segments(user_name, scoped_requests)
 
     # Tier 1.2: Overlapping dates / half-days with any active (Pending or Approved) leave
     overlap_slots = [s for s in range(new_s, new_e + 1) if s in slot_type_map]
@@ -2659,10 +3474,6 @@ def validate_leave_application(
         )
 
     # Tier 1.3: Direct consecutive-day cap (default: CL exceeding 5.0 consecutive days)
-    max_consec_limit = float(
-        _types_cfg.get(lt, {}).get("Max_Consecutive_Days", MAX_CONSECUTIVE_CL_DAYS if lt == "CL" else 0.0)
-    ) if _types_cfg else (MAX_CONSECUTIVE_CL_DAYS if lt == "CL" else 0.0)
-
     direct_consec_ok = True
     if max_consec_limit > 0:
         lt_label = "Casual Leave" if lt == "CL" else f"{lt} Leave"
@@ -3309,6 +4120,7 @@ def open_pdf_dialog(pdf_bytes, filename="Leave.pdf"):
 
 
 def calculate_balances(user_name, user_row_override=None, df_req_override=None, reference_date=None, rules_override=None):
+    import math as _math
     _resolve_rules_fn = globals().get("get_effective_leave_rules")
     _rules = _resolve_rules_fn(rules_override) if callable(_resolve_rules_fn) else (rules_override if isinstance(rules_override, dict) else {})
     _types_cfg = _rules.get("leave_types", {}) if isinstance(_rules, dict) else {}
@@ -3316,8 +4128,8 @@ def calculate_balances(user_name, user_row_override=None, df_req_override=None, 
     ul_affects_svc = bool(_types_cfg.get("UL", {}).get("Affects_Service_Year", True))
     service_freeze_active = bool(_global_cfg.get("Service_Freeze_Rule", True))
     extra_svc_types = {
-        k for k in ("CL", "SL", "AL")
-        if bool(_types_cfg.get(k, {}).get("Affects_Service_Year", False))
+        k for k, v in _types_cfg.items()
+        if k != "UL" and isinstance(v, dict) and bool(v.get("Affects_Service_Year", False))
     }
 
     if user_row_override is not None:
@@ -3378,6 +4190,63 @@ def calculate_balances(user_name, user_row_override=None, df_req_override=None, 
     unpartitioned_ul_total = 0.0
     cur_fy_ul_total = 0.0
 
+    _tz_cb = globals().get("CTA_TZ")
+
+    def _parse_cb_date(val):
+        if val is None:
+            return None
+        if isinstance(val, datetime):
+            if getattr(val, "tzinfo", None) is not None and _tz_cb is not None:
+                return val.astimezone(_tz_cb).date()
+            return val.date()
+        if hasattr(val, "to_pydatetime"):
+            try:
+                if pd.isnull(val):
+                    return None
+                ts = val.to_pydatetime()
+                if getattr(ts, "tzinfo", None) is not None and _tz_cb is not None:
+                    return ts.astimezone(_tz_cb).date()
+                return ts.date() if ts is not None else None
+            except Exception:
+                return None
+        if isinstance(val, date):
+            return val
+        try:
+            if pd.isnull(val):
+                return None
+        except Exception:
+            pass
+        s = str(val).strip()
+        if not s or s.lower() in ("nan", "none", "nat", "null"):
+            return None
+        if ("T" in s or s.endswith(("Z", "z"))) and len(s) > 10:
+            try:
+                dt = datetime.fromisoformat(s.replace("Z", "+00:00").replace("z", "+00:00"))
+                if dt.tzinfo is not None and _tz_cb is not None:
+                    return dt.astimezone(_tz_cb).date()
+                return dt.date()
+            except Exception:
+                pass
+        for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y", "%d/%m/%Y", "%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S"):
+            try:
+                return datetime.strptime(s, fmt).date()
+            except ValueError:
+                continue
+        try:
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is not None and _tz_cb is not None:
+                return dt.astimezone(_tz_cb).date()
+            return dt.date()
+        except Exception:
+            pass
+        if len(s) >= 10:
+            for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y", "%d/%m/%Y"):
+                try:
+                    return datetime.strptime(s[:10], fmt).date()
+                except ValueError:
+                    continue
+        return None
+
     has_joining = bool(joining_date_str and joining_date_str not in ["nan", "None", "", "NaT", "NAT"])
     if has_joining or df_req_override is not None:
         try:
@@ -3386,92 +4255,109 @@ def calculate_balances(user_name, user_row_override=None, df_req_override=None, 
             req_total_penalty = 0.0
             unpartitioned_req_total = 0.0
             if df_req is not None and not df_req.empty:
-                is_ul = df_req["LeaveType"].isin(["UL", "Return-UL"])
-                is_eff = (df_req["EffectsServiceYear"].astype(str).str.strip().str.lower() == "yes") if "EffectsServiceYear" in df_req.columns else False
+                target_uname = str(user_name).strip()
+                pen_lt_set = {"UL", "Return-UL", "Rev-UL"}
                 if extra_svc_types:
-                    extra_names = set(extra_svc_types) | {f"Return-{k}" for k in extra_svc_types} | {f"Rev-{k}" for k in extra_svc_types}
-                    is_extra_svc = df_req["LeaveType"].isin(extra_names)
-                else:
-                    is_extra_svc = False
-                my_pen_leaves = df_req[
-                    (df_req["Name"] == user_name) &
-                    (df_req["Status"] == "Approved") &
-                    (is_ul | is_eff | is_extra_svc)
+                    pen_lt_set |= set(extra_svc_types) | {f"Return-{k}" for k in extra_svc_types} | {f"Rev-{k}" for k in extra_svc_types}
+                n_req = len(df_req)
+                r_names = df_req["Name"].tolist() if "Name" in df_req.columns else [""] * n_req
+                r_stats = df_req["Status"].tolist() if "Status" in df_req.columns else [""] * n_req
+                r_lts = df_req["LeaveType"].tolist() if "LeaveType" in df_req.columns else [""] * n_req
+                r_effs = df_req["EffectsServiceYear"].tolist() if "EffectsServiceYear" in df_req.columns else [""] * n_req
+                pen_idx = [
+                    i for i, (nm_v, st_v, lt_v, ef_v) in enumerate(zip(r_names, r_stats, r_lts, r_effs))
+                    if str(nm_v).strip() == target_uname
+                    and str(st_v).strip() == "Approved"
+                    and (str(lt_v).strip() in pen_lt_set or str(ef_v).strip().lower() == "yes")
                 ]
-                cur_fy_yr = fy_start.year
-                breakdown_func = globals().get("get_leave_fy_breakdown")
-                if breakdown_func is None:
-                    def breakdown_func(s_d, e_d, t_d=None):
-                        if s_d is None or e_d is None: return {}
+                if pen_idx:
+                    my_pen_leaves = df_req.iloc[pen_idx]
+                    cur_fy_yr = fy_start.year
+                    breakdown_func = globals().get("get_leave_fy_breakdown")
+                    if breakdown_func is None:
+                        def breakdown_func(s_d, e_d, t_d=None):
+                            if s_d is None or e_d is None: return {}
+                            try:
+                                s_d = pd.to_datetime(s_d).date() if not isinstance(s_d, date) else s_d
+                                e_d = pd.to_datetime(e_d).date() if not isinstance(e_d, date) else e_d
+                            except Exception: return {}
+                            if s_d > e_d: return {}
+                            tot_cal = (e_d - s_d).days + 1
+                            if tot_cal <= 0: return {}
+                            s_yr = s_d.year if s_d.month >= 4 else s_d.year - 1
+                            e_yr = e_d.year if e_d.month >= 4 else e_d.year - 1
+                            from collections import OrderedDict
+                            res = OrderedDict()
+                            for y in range(s_yr, e_yr + 1):
+                                c_s = max(s_d, date(y, 4, 1))
+                                c_e = min(e_d, date(y + 1, 3, 31))
+                                c_cal = max(0, (c_e - c_s).days + 1)
+                                d = float(t_d) * (float(c_cal) / float(tot_cal)) if t_d is not None else float(c_cal)
+                                res[y] = {"fy_year": y, "fy_label": f"FY {y}-{y + 1}", "seg_start": c_s, "seg_end": c_e, "days": round(d, 2)}
+                            return res
+
+                    for _, l_row in my_pen_leaves.iterrows():
                         try:
-                            s_d = pd.to_datetime(s_d).date() if not isinstance(s_d, date) else s_d
-                            e_d = pd.to_datetime(e_d).date() if not isinstance(e_d, date) else e_d
-                        except Exception: return {}
-                        if s_d > e_d: return {}
-                        tot_cal = (e_d - s_d).days + 1
-                        if tot_cal <= 0: return {}
-                        s_yr = s_d.year if s_d.month >= 4 else s_d.year - 1
-                        e_yr = e_d.year if e_d.month >= 4 else e_d.year - 1
-                        from collections import OrderedDict
-                        res = OrderedDict()
-                        for y in range(s_yr, e_yr + 1):
-                            c_s = max(s_d, date(y, 4, 1))
-                            c_e = min(e_d, date(y + 1, 3, 31))
-                            c_cal = max(0, (c_e - c_s).days + 1)
-                            d = float(t_d) * (float(c_cal) / float(tot_cal)) if t_d is not None else float(c_cal)
-                            res[y] = {"fy_year": y, "fy_label": f"FY {y}-{y + 1}", "seg_start": c_s, "seg_end": c_e, "days": round(d, 2)}
-                        return res
+                            l_start = _parse_cb_date(l_row.get("StartDate"))
+                            l_end = _parse_cb_date(l_row.get("EndDate"))
+                            if l_start is None or l_end is None or l_end < fy_start:
+                                continue
+                            raw_td = l_row.get("TotalDays", 0.0)
+                            if raw_td is None or (isinstance(raw_td, float) and not _math.isfinite(raw_td)):
+                                continue
+                            if pd.isnull(raw_td):
+                                continue
+                            s_td = str(raw_td).strip()
+                            if s_td == "" or s_td.startswith("="):
+                                continue
+                            l_days = float(s_td)
+                            if not _math.isfinite(l_days):
+                                continue
+                            l_type_str = str(l_row.get("LeaveType", "")).strip()
+                            row_is_ul = l_type_str in ("UL", "Return-UL", "Rev-UL")
+                            row_is_eff = str(l_row.get("EffectsServiceYear", "")).strip().lower() == "yes"
+                            row_base_lt = l_type_str[len("Return-"):] if l_type_str.startswith("Return-") else (l_type_str[len("Rev-"):] if l_type_str.startswith("Rev-") else l_type_str)
+                            row_counts_for_svc = (row_is_ul and ul_affects_svc) or row_is_eff or (row_base_lt in extra_svc_types)
 
-                for _, l_row in my_pen_leaves.iterrows():
-                    try:
-                        l_start = pd.to_datetime(l_row["StartDate"]).date()
-                        l_end = pd.to_datetime(l_row["EndDate"]).date()
-                        l_days = float(l_row["TotalDays"])
-                        l_type_str = str(l_row.get("LeaveType", "")).strip()
-                        row_is_ul = l_type_str in ["UL", "Return-UL"]
-                        row_is_eff = str(l_row.get("EffectsServiceYear", "")).strip().lower() == "yes"
-                        row_base_lt = l_type_str[len("Return-"):] if l_type_str.startswith("Return-") else (l_type_str[len("Rev-"):] if l_type_str.startswith("Rev-") else l_type_str)
-                        row_counts_for_svc = (row_is_ul and ul_affects_svc) or row_is_eff or (row_base_lt in extra_svc_types)
+                            bdown = breakdown_func(l_start, l_end, l_days)
+                            if row_is_ul:
+                                for b_yr, b_info in bdown.items():
+                                    if b_yr > cur_fy_yr:
+                                        future_committed_ul += float(b_info["days"])
+                                    elif b_yr == cur_fy_yr:
+                                        cur_fy_ul_total += float(b_info["days"])
 
-                        bdown = breakdown_func(l_start, l_end, l_days)
-                        if row_is_ul:
-                            for b_yr, b_info in bdown.items():
-                                if b_yr > cur_fy_yr:
-                                    future_committed_ul += float(b_info["days"])
-                                elif b_yr == cur_fy_yr:
-                                    cur_fy_ul_total += float(b_info["days"])
+                            if cur_fy_yr not in bdown:
+                                continue
+                            cur_and_future_days = sum(float(b_info["days"]) for b_yr, b_info in bdown.items() if b_yr >= cur_fy_yr)
+                            if row_is_ul:
+                                unpartitioned_ul_total += cur_and_future_days
+                            if not row_counts_for_svc:
+                                continue
+                            unpartitioned_req_total += cur_and_future_days
+                            cur_info = bdown[cur_fy_yr]
+                            cur_fy_days = float(cur_info["days"])
+                            seg_start = cur_info["seg_start"]
+                            seg_end = cur_info["seg_end"]
 
-                        if cur_fy_yr not in bdown:
+                            req_total_penalty += cur_fy_days
+                            if not service_freeze_active:
+                                req_elapsed_penalty += cur_fy_days
+                            elif today_d < seg_start:
+                                continue
+                            elif today_d >= seg_end:
+                                req_elapsed_penalty += cur_fy_days
+                            else:
+                                seg_cal = max(1, (seg_end - seg_start).days + 1)
+                                elapsed_cal = max(0, (today_d - seg_start).days + 1)
+                                scaled_cur = cur_fy_days * (float(elapsed_cal) / float(seg_cal))
+                                elapsed_cur = min(cur_fy_days, scaled_cur) if cur_fy_days >= 0 else max(cur_fy_days, scaled_cur)
+                                req_elapsed_penalty += elapsed_cur
+                        except Exception:
                             continue
-                        cur_and_future_days = sum(float(b_info["days"]) for b_yr, b_info in bdown.items() if b_yr >= cur_fy_yr)
-                        if row_is_ul:
-                            unpartitioned_ul_total += cur_and_future_days
-                        if not row_counts_for_svc:
-                            continue
-                        unpartitioned_req_total += cur_and_future_days
-                        cur_info = bdown[cur_fy_yr]
-                        cur_fy_days = float(cur_info["days"])
-                        seg_start = cur_info["seg_start"]
-                        seg_end = cur_info["seg_end"]
-
-                        req_total_penalty += cur_fy_days
-                        if not service_freeze_active:
-                            req_elapsed_penalty += cur_fy_days
-                        elif today_d < seg_start:
-                            continue
-                        elif today_d >= seg_end:
-                            req_elapsed_penalty += cur_fy_days
-                        else:
-                            seg_cal = max(1, (seg_end - seg_start).days + 1)
-                            elapsed_cal = max(0, (today_d - seg_start).days + 1)
-                            scaled_cur = cur_fy_days * (float(elapsed_cal) / float(seg_cal))
-                            elapsed_cur = min(cur_fy_days, scaled_cur) if cur_fy_days >= 0 else max(cur_fy_days, scaled_cur)
-                            req_elapsed_penalty += elapsed_cur
-                    except Exception:
-                        pass
 
             if has_joining:
-                j_date = pd.to_datetime(joining_date_str).date()
+                j_date = _parse_cb_date(joining_date_str) or pd.to_datetime(joining_date_str).date()
                 total_cal_days = max(0, (today_d - j_date).days)
                 total_cal_years = round(total_cal_days / 365.25, 2)
 
@@ -4199,8 +5085,8 @@ def employee_dashboard(hide_title=False):
             else:
                 st.error(msg)
 
-        preview_pdf_bytes = generate_leave_pdf(preview_row)
         if col_prev.button("👁️ Preview PDF Form", key="btn_prev_leave_pdf", disabled=is_submit_busy):
+            preview_pdf_bytes = generate_leave_pdf(preview_row)
             open_pdf_dialog(preview_pdf_bytes, "Preview.pdf")
 
         leave_submit_kind = "leave_reversal" if is_reversal else "leave_request"
@@ -4289,10 +5175,10 @@ def employee_dashboard(hide_title=False):
                                     [df for df in [df_requests, new_request] if df is not None],
                                     ignore_index=True,
                                 )
-                                conn.update(worksheet="LeaveRequests", data=updated_df)
+                                _gsheets_retry(conn.update, worksheet="LeaveRequests", data=updated_df)
                             # Disarm pending action once sheet update succeeds so interruption during alerts cannot duplicate
                             st.session_state["_submit_pending_kind"] = None
-                            st.cache_data.clear()
+                            _invalidate_sheet_cache("LeaveRequests")
                             action_word = "requested to RESTORE" if is_reversal else "requested"
                             req_title = "Leave Reversal Request 🔄" if is_reversal else "New Leave Request 📅"
                         
@@ -4349,9 +5235,19 @@ def employee_dashboard(hide_title=False):
 
         st.subheader("Your Past Requests")
         df_requests = load_leave_requests()
-        if not df_requests.empty and "Name" in df_requests.columns:
-            user_requests = df_requests[df_requests["Name"]
-                                        == st.session_state.user_name]
+        emp_fy_sel = render_fy_scope_selector(
+            key="emp_fy_scope",
+            label="📅 Select Financial Year (FY) for Your Leave & Tour History",
+            include_all=True,
+            leave_df=df_requests,
+        )
+        emp_fy_yr = emp_fy_sel["fy_year"] if isinstance(emp_fy_sel, dict) else None
+        emp_fy_records = load_fy_records(emp_fy_yr, leave_df_active=df_requests)
+        emp_hist_leaves = emp_fy_records["leaves"]
+
+        if emp_hist_leaves is not None and not emp_hist_leaves.empty and "Name" in emp_hist_leaves.columns:
+            user_requests = emp_hist_leaves[emp_hist_leaves["Name"]
+                                            == st.session_state.user_name]
             if not user_requests.empty:
                 pending = user_requests[user_requests["Status"] == "Pending"]
                 others = user_requests[user_requests["Status"] != "Pending"]
@@ -4359,23 +5255,24 @@ def employee_dashboard(hide_title=False):
                 if not pending.empty:
                     st.markdown("**⏳ Pending Requests (Can be deleted)**")
                     for idx, row in pending.iterrows():
+                        is_row_active = _is_active_sheet_row(row)
                         col1, col2, col3 = st.columns([4, 1, 1])
                         col1.write(
                             f"**{row['LeaveType']}** for {row['TotalDays']} days ({row['StartDate']} to {row['EndDate']})")
                     
-                        pdf_bytes = generate_leave_pdf(row)
                         if col2.button("📄 Preview", key=f"prev_emp_pend_{row['ID']}", disabled=is_submit_busy):
+                            pdf_bytes = generate_leave_pdf(row)
                             open_pdf_dialog(pdf_bytes, f"{row['Name']}_Leave.pdf")
 
                         target_req_id = str(row['ID']).strip()
                         del_clicked = col3.button(
                             "🗑️ Delete",
                             key=f"del_{target_req_id}",
-                            disabled=is_submit_busy,
+                            disabled=(is_submit_busy or not is_row_active),
                             on_click=_arm_submission_freeze,
                             args=("leave_cancellation", target_req_id),
                         )
-                        is_this_cancelling = (
+                        is_this_cancelling = is_row_active and (
                             del_clicked or (
                                 st.session_state.get("_submit_pending_kind") == "leave_cancellation"
                                 and st.session_state.get("_submit_request_id") == target_req_id
@@ -4385,13 +5282,13 @@ def employee_dashboard(hide_title=False):
                             try:
                                 load_leave_requests.clear()
                                 fresh_requests = load_leave_requests()
-                                match_idx = fresh_requests[fresh_requests["ID"].astype(str).str.strip() == target_req_id].index
+                                match_idx = fresh_requests[fresh_requests["ID"].map(_normalize_record_id) == _normalize_record_id(target_req_id)].index
                                 if not match_idx.empty:
                                     curr_status = str(fresh_requests.at[match_idx[0], "Status"]).strip()
                                     if curr_status == "Pending":
                                         fresh_requests.at[match_idx[0], "Status"] = "Cancelled"
-                                        conn.update(worksheet="LeaveRequests", data=fresh_requests)
-                                        st.cache_data.clear()
+                                        _gsheets_retry(conn.update, worksheet="LeaveRequests", data=fresh_requests)
+                                        _invalidate_sheet_cache("LeaveRequests")
 
                                         send_ntfy_notification(
                                             get_role_ntfy_topics("Admin"),
@@ -4428,8 +5325,8 @@ def employee_dashboard(hide_title=False):
                         col1.write(
                             f"**{row['LeaveType']}** for {row['TotalDays']} days ({row['StartDate']} to {row['EndDate']}) - Status: {row['Status']}")
                         if row['Status'] == "Approved":
-                            pdf_bytes = generate_leave_pdf(row)
                             if col2.button("📄 Preview PDF", key=f"prev_emp_{row['ID']}", disabled=is_submit_busy):
+                                pdf_bytes = generate_leave_pdf(row)
                                 open_pdf_dialog(
                                     pdf_bytes, f"{row['Name']}_{row['StartDate']}_Leave.pdf")
             else:
@@ -4450,13 +5347,14 @@ def employee_dashboard(hide_title=False):
             else:
                 st.error(msg)
 
-        tours_df = load_tour_sanctions()
-        my_tours = tours_df[tours_df["Name"] == st.session_state.user_name] if tours_df is not None and not tours_df.empty else pd.DataFrame()
+        tours_df = emp_fy_records["tours"]
+        my_tours = tours_df[tours_df["Name"] == st.session_state.user_name] if tours_df is not None and not tours_df.empty and "Name" in tours_df.columns else pd.DataFrame()
 
         # 1. Prominent Current Tour Sanction Card
         if not my_tours.empty:
-            cur_tr = my_tours.iloc[-1]
+            cur_tr = my_tours.iloc[0]
             tr_status = str(cur_tr.get("Status", "Pending"))
+            is_cur_tr_active = _is_active_sheet_row(cur_tr)
             with st.container(border=True):
                 st.markdown(f"#### 📌 Current Tour Sanction: **To {cur_tr.get('Destination', '')} ({cur_tr.get('TotalDays', 0)} Day(s))**")
                 c_dt, c_st, c_pdf = st.columns([2.5, 1.5, 2])
@@ -4498,11 +5396,14 @@ def employee_dashboard(hide_title=False):
                         elif cur_tr.get('SelectedCoAdmin'):
                             st.caption(f"Assigned Co-Admin: {cur_tr['SelectedCoAdmin']}")
                 with c_pdf:
-                    cur_tr_pdf = generate_tour_sanction_pdf(cur_tr)
-                    if cur_tr_pdf:
-                        if st.button("👁️ Preview Current Tour PDF", key="btn_cur_tr_pdf", type="primary", use_container_width=True, disabled=is_submit_busy):
+                    if st.button("👁️ Preview Current Tour PDF", key="btn_cur_tr_pdf", type="primary", use_container_width=True, disabled=is_submit_busy):
+                        cur_tr_pdf = generate_tour_sanction_pdf(cur_tr)
+                        if cur_tr_pdf:
                             open_pdf_dialog(cur_tr_pdf, f"{st.session_state.user_name}_Current_Tour_Sanction.pdf")
-                        st.download_button("⬇️ Download Tour PDF", data=cur_tr_pdf, file_name=f"{st.session_state.user_name}_Current_Tour_Sanction.pdf", mime="application/pdf", key="dl_cur_tr_pdf", use_container_width=True)
+                    if st.button("⬇️ Prepare Tour PDF", key="btn_prep_cur_tr_dl", use_container_width=True, disabled=is_submit_busy):
+                        cur_tr_pdf = generate_tour_sanction_pdf(cur_tr)
+                        if cur_tr_pdf:
+                            st.download_button("⬇️ Download Tour PDF", data=cur_tr_pdf, file_name=f"{st.session_state.user_name}_Current_Tour_Sanction.pdf", mime="application/pdf", key="dl_cur_tr_pdf", use_container_width=True)
 
                     if tr_status not in ['Sanctioned', 'Completed', 'Settled', 'Rejected', 'Cancelled']:
                         cur_tr_id = str(cur_tr.get('ID', '')).strip()
@@ -4511,11 +5412,11 @@ def employee_dashboard(hide_title=False):
                             key=f"btn_cur_canc_{cur_tr_id}",
                             help="Withdraw this pending tour sanction application",
                             use_container_width=True,
-                            disabled=is_submit_busy,
+                            disabled=(is_submit_busy or not is_cur_tr_active),
                             on_click=_arm_submission_freeze,
                             args=("tour_cancellation", cur_tr_id),
                         )
-                        is_this_cancelling_tr = (
+                        is_this_cancelling_tr = is_cur_tr_active and (
                             canc_clicked or (
                                 st.session_state.get("_submit_pending_kind") == "tour_cancellation"
                                 and st.session_state.get("_submit_request_id") == cur_tr_id
@@ -4531,8 +5432,8 @@ def employee_dashboard(hide_title=False):
                                         curr_status = str(all_tours.at[match_idx[0], "Status"]).strip()
                                         if curr_status not in ['Sanctioned', 'Completed', 'Settled', 'Rejected', 'Cancelled']:
                                             all_tours.at[match_idx[0], "Status"] = "Cancelled"
-                                            conn.update(worksheet="TourSanctions", data=all_tours)
-                                            st.cache_data.clear()
+                                            _gsheets_retry(conn.update, worksheet="TourSanctions", data=all_tours)
+                                            _invalidate_sheet_cache("TourSanctions")
 
                                             co_admin_name = str(cur_tr.get("SelectedCoAdmin", "")).strip()
                                             if co_admin_name and co_admin_name.lower() not in ["none", "nan", ""]:
@@ -4858,9 +5759,9 @@ def employee_dashboard(hide_title=False):
                                         [df for df in [current_tours, pd.DataFrame([new_tour])] if df is not None],
                                         ignore_index=True,
                                     )
-                                    conn.update(worksheet="TourSanctions", data=updated_tours)
+                                    _gsheets_retry(conn.update, worksheet="TourSanctions", data=updated_tours)
                                 st.session_state["_submit_pending_kind"] = None
-                                st.cache_data.clear()
+                                _invalidate_sheet_cache("TourSanctions")
                                 st.session_state.tour_legs_count = 1
 
                                 is_direct_admin_tour = (t_coadmin == "Not-Applicable")
@@ -4923,7 +5824,8 @@ def employee_dashboard(hide_title=False):
         if my_tours.empty:
             st.info("No tour sanction applications on record.")
         else:
-            for _, tr in my_tours.iloc[::-1].iterrows():
+            for _, tr in my_tours.iterrows():
+                is_tr_act = _is_active_sheet_row(tr)
                 with st.container(border=True):
                     c1, c2, c3 = st.columns([3, 1, 1.2])
                     with c1:
@@ -4948,9 +5850,9 @@ def employee_dashboard(hide_title=False):
                         else:
                             st.warning(t_status)
                     with c3:
-                        pdf_data = generate_tour_sanction_pdf(tr)
-                        if pdf_data:
-                            if st.button("👁️ View Tour Form (PDF)", key=f"tour_pdf_{tr.get('ID', '')}", use_container_width=True, disabled=is_submit_busy):
+                        if st.button("👁️ View Tour Form (PDF)", key=f"tour_pdf_{tr.get('ID', '')}", use_container_width=True, disabled=is_submit_busy):
+                            pdf_data = generate_tour_sanction_pdf(tr)
+                            if pdf_data:
                                 open_pdf_dialog(pdf_data, f"{st.session_state.user_name}_Tour_Sanction_{tr.get('ID', '')}.pdf")
 
                         hist_tr_id = str(tr.get('ID', '')).strip()
@@ -4960,11 +5862,11 @@ def employee_dashboard(hide_title=False):
                                 key=f"cancel_tr_{hist_tr_id}",
                                 use_container_width=True,
                                 help="Withdraw this pending application",
-                                disabled=is_submit_busy,
+                                disabled=(is_submit_busy or not is_tr_act),
                                 on_click=_arm_submission_freeze,
                                 args=("tour_cancellation", hist_tr_id),
                             )
-                            is_hist_cancelling = (
+                            is_hist_cancelling = is_tr_act and (
                                 canc_hist_clicked or (
                                     st.session_state.get("_submit_pending_kind") == "tour_cancellation"
                                     and st.session_state.get("_submit_request_id") == hist_tr_id
@@ -4980,8 +5882,8 @@ def employee_dashboard(hide_title=False):
                                             curr_h_status = str(all_tours.at[match_idx[0], "Status"]).strip()
                                             if curr_h_status not in ['Sanctioned', 'Completed', 'Settled', 'Rejected', 'Cancelled']:
                                                 all_tours.at[match_idx[0], "Status"] = "Cancelled"
-                                                conn.update(worksheet="TourSanctions", data=all_tours)
-                                                st.cache_data.clear()
+                                                _gsheets_retry(conn.update, worksheet="TourSanctions", data=all_tours)
+                                                _invalidate_sheet_cache("TourSanctions")
 
                                                 co_admin_name = str(tr.get("SelectedCoAdmin", "")).strip()
                                                 if co_admin_name and co_admin_name.lower() not in ["none", "nan", ""]:
@@ -5160,7 +6062,7 @@ def render_balance_adjustment_panel(
                                 current_balances=cur_bal_fresh,
                                 authorized_branches=allowed_branches,
                             )
-                            conn.update(worksheet="Staff_Master", data=inject_balance_formulas(updated_df))
+                            _gsheets_retry(conn.update, worksheet="Staff_Master", data=inject_balance_formulas(updated_df))
                             adjuster_user = st.session_state.get("user_name", "Admin")
                             record_balance_audit_log(
                                 adjuster=adjuster_user,
@@ -5171,7 +6073,7 @@ def render_balance_adjustment_panel(
                                 net_delta=net_diff,
                                 reason=adj_reason.strip(),
                             )
-                            st.cache_data.clear()
+                            _invalidate_sheet_cache("Staff_Master", "AuditLog")
                             st.success(
                                 f"✅ Updated {adj_staff_name}'s {adj_category_label}: "
                                 f"{old_val:g} -> {new_val:g} (Net: {net_diff:+g}). Reason: {adj_reason.strip()}"
@@ -5408,9 +6310,9 @@ def render_fy_rollover_simulator(scoped_staff_df, is_admin=True, key_prefix="sys
                         synced_live = inject_balance_formulas(
                             rolled_live, df_req_override=req_df_sim, reference_date=sim_target_date
                         )
-                        conn.update(worksheet="Staff_Master", data=synced_live)
+                        _gsheets_retry(conn.update, worksheet="Staff_Master", data=synced_live)
                         st.session_state["_applied_rollover_target_fy"] = live_info.get("target_fy", next_fy_lbl)
-                        st.cache_data.clear()
+                        _invalidate_sheet_cache("Staff_Master")
                         st.success(
                             f"✅ Live Test FY Rollover applied ({format_fy_short(live_info.get('target_fy', next_fy_lbl))})! "
                             f"Click '⏪ Restore Pre-Test FY Snapshot' anytime to revert to `{format_fy_short(fy_label)}`."
@@ -5425,10 +6327,10 @@ def render_fy_rollover_simulator(scoped_staff_df, is_admin=True, key_prefix="sys
                 ):
                     snap_df = st.session_state.get("_pre_rollover_test_snapshot")
                     if snap_df is not None and not snap_df.empty:
-                        conn.update(worksheet="Staff_Master", data=snap_df)
+                        _gsheets_retry(conn.update, worksheet="Staff_Master", data=snap_df)
                         del st.session_state["_pre_rollover_test_snapshot"]
                         st.session_state.pop("_applied_rollover_target_fy", None)
-                        st.cache_data.clear()
+                        _invalidate_sheet_cache("Staff_Master")
                         st.success("✅ Restored Staff_Master to exact pre-test snapshot!")
                         st.rerun()
 
@@ -5442,9 +6344,25 @@ def render_master_balance_table():
         st.caption(f"🔎 Showing staff for branch(es): **{', '.join(allowed_branches)}**")
     scoped_staff_df = filter_df_by_branches(staff_df, allowed_branches, branch_map, name_col="Name")
     if scoped_staff_df is not None and not scoped_staff_df.empty:
+        df_req = load_leave_requests()
+        rules_override = get_effective_leave_rules()
+        req_by_name = {}
+        empty_req = pd.DataFrame(columns=df_req.columns) if df_req is not None else pd.DataFrame()
+        if df_req is not None and not df_req.empty and "Name" in df_req.columns:
+            req_sub = df_req[df_req["Status"].astype(str).str.strip() == "Approved"] if "Status" in df_req.columns else df_req
+            if not req_sub.empty:
+                for emp_k, grp in req_sub.groupby(req_sub["Name"].astype(str).str.strip(), sort=False):
+                    req_by_name[emp_k] = grp
         balances_list = []
-        for name in scoped_staff_df["Name"]:
-            bal = calculate_balances(name)
+        for _, s_row in scoped_staff_df.iterrows():
+            name = s_row["Name"]
+            name_key = str(name).strip()
+            bal = calculate_balances(
+                name,
+                user_row_override=s_row,
+                df_req_override=req_by_name.get(name_key, empty_req),
+                rules_override=rules_override,
+            )
             balances_list.append({
                 "Name": name,
                 "Branch": branch_map.get(str(name).strip(), "HQ"),
@@ -5822,13 +6740,14 @@ def render_system_settings(is_admin=True):
                     save_leave_rules(new_rules_payload)
                     if staff_df is not None and not staff_df.empty:
                         try:
-                            conn.update(
+                            _gsheets_retry(
+                                conn.update,
                                 worksheet="Staff_Master",
                                 data=inject_balance_formulas(staff_df, rules_override=new_rules_payload),
                             )
                         except Exception:
                             pass
-                    st.cache_data.clear()
+                    _invalidate_sheet_cache("LeaveRules", "Staff_Master")
                     st.session_state["_leave_rules_flash_msg"] = (
                         "✅ Saved General Leave Rules & Policy Configuration! All formulas, caps, and rollover rules are now active."
                     )
@@ -5853,7 +6772,7 @@ def render_system_settings(is_admin=True):
                         "rule_gl_ul_career_cap", "rule_gl_svc_freeze", "rule_gl_auto_ul_pen"
                     ):
                         st.session_state.pop(gk, None)
-                    st.cache_data.clear()
+                    _invalidate_sheet_cache("LeaveRules")
                     st.session_state["_leave_rules_flash_msg"] = (
                         "✅ Reset all Leave Rules & Quotas to official CTA defaults!"
                     )
@@ -5921,8 +6840,8 @@ def render_system_settings(is_admin=True):
                 else:
                     with st.spinner(f"Updating Gmail for {sel_u_gmail}..."):
                         users_df.at[sel_u_idx, "Email"] = clean_email
-                        conn.update(worksheet="Users", data=users_df)
-                        st.cache_data.clear()
+                        _gsheets_retry(conn.update, worksheet="Users", data=users_df)
+                        _invalidate_sheet_cache("Users")
                         st.success(f"✅ Successfully linked Gmail '{clean_email}' to {sel_u_gmail}!")
                         st.rerun()
 
@@ -5967,8 +6886,8 @@ def render_system_settings(is_admin=True):
                                     "Branch": "HQ",
                                     "Email": aud_email.strip().lower(),
                                 }])
-                                conn.update(worksheet="Users", data=pd.concat([users_df, new_aud_row], ignore_index=True))
-                                st.cache_data.clear()
+                                _gsheets_retry(conn.update, worksheet="Users", data=pd.concat([users_df, new_aud_row], ignore_index=True))
+                                _invalidate_sheet_cache("Users")
                                 st.success(f"✅ Created Auditor account for **{aud_name.strip()}** (`{aud_email.strip().lower()}`) with zero leave/tour balance!")
                                 st.rerun()
 
@@ -6128,9 +7047,9 @@ def render_system_settings(is_admin=True):
                                 "Email": new_email.strip().lower()
                             }])
 
-                            conn.update(worksheet="Users", data=pd.concat([users_df, new_u_row], ignore_index=True))
+                            _gsheets_retry(conn.update, worksheet="Users", data=pd.concat([users_df, new_u_row], ignore_index=True))
                             if is_auditor_role:
-                                st.cache_data.clear()
+                                _invalidate_sheet_cache("Users")
                                 st.success(f"✅ Added Auditor {new_name.strip()} ({new_email.strip().lower()}) with read-only oversight (no leave/tour balance) and private channel: {new_topic}")
                                 st.rerun()
                             else:
@@ -6151,8 +7070,8 @@ def render_system_settings(is_admin=True):
                                 }])
 
                                 merged_sm = pd.concat([staff_df, new_sm_row], ignore_index=True)
-                                conn.update(worksheet="Staff_Master", data=inject_balance_formulas(merged_sm))
-                                st.cache_data.clear()
+                                _gsheets_retry(conn.update, worksheet="Staff_Master", data=inject_balance_formulas(merged_sm))
+                                _invalidate_sheet_cache("Users", "Staff_Master")
                                 st.success(f"✅ Added {new_name} ({new_role}) with full leave ledger and private channel: {new_topic}")
                                 st.rerun()
 
@@ -6548,12 +7467,12 @@ def render_system_settings(is_admin=True):
                     users_df.at[u_idx, "Branch"] = edit_branch.strip()
                     users_df.at[u_idx, "PIN"] = str(new_pin_reset).strip()
                     users_df.at[u_idx, "Email"] = str(edit_email).strip().lower()
-                    conn.update(worksheet="Users", data=users_df)
+                    _gsheets_retry(conn.update, worksheet="Users", data=users_df)
 
                     if is_edit_auditor:
                         if staff_df is not None and not staff_df.empty and sm_idx is not None:
                             sm_after = staff_df[staff_df["Name"].astype(str).str.strip() != str(e_user).strip()]
-                            conn.update(worksheet="Staff_Master", data=sm_after)
+                            _gsheets_retry(conn.update, worksheet="Staff_Master", data=sm_after)
                     elif staff_df is not None and not staff_df.empty and sm_idx is not None:
                         for c in staff_df.columns:
                             staff_df[c] = staff_df[c].astype(object)
@@ -6604,9 +7523,9 @@ def render_system_settings(is_admin=True):
                             if abs(ed_act_svc - cur_act_svc) > 1e-6:
                                 synced_sm.at[sm_idx, "Actual Service Year"] = ed_act_svc
 
-                        conn.update(worksheet="Staff_Master", data=synced_sm)
+                        _gsheets_retry(conn.update, worksheet="Staff_Master", data=synced_sm)
 
-                    st.cache_data.clear()
+                    _invalidate_sheet_cache("Users", "Staff_Master")
                     st.success(f"✅ Updated profile, PIN, and complete leave ledger for {clean_new_name}!")
                     st.rerun()
 
@@ -6619,11 +7538,11 @@ def render_system_settings(is_admin=True):
                             st.error("Please check the confirmation box first.")
                         else:
                             users_after = users_df[users_df["Name"].astype(str).str.strip() != str(e_user).strip()]
-                            conn.update(worksheet="Users", data=users_after)
+                            _gsheets_retry(conn.update, worksheet="Users", data=users_after)
                             if staff_df is not None and not staff_df.empty:
                                 sm_after = staff_df[staff_df["Name"].astype(str).str.strip() != str(e_user).strip()]
-                                conn.update(worksheet="Staff_Master", data=sm_after)
-                            st.cache_data.clear()
+                                _gsheets_retry(conn.update, worksheet="Staff_Master", data=sm_after)
+                            _invalidate_sheet_cache("Users", "Staff_Master")
                             st.success(f"Removed {e_user} from Users and Staff_Master.")
                             st.rerun()
 
@@ -6659,9 +7578,9 @@ def render_system_settings(is_admin=True):
                         staff_df.at[idx,
                                     "Encashed_AL"] = curr_encashed + encash_days
 
-                        conn.update(worksheet="Staff_Master",
-                                    data=inject_balance_formulas(staff_df))
-                        st.cache_data.clear()
+                        _gsheets_retry(conn.update, worksheet="Staff_Master",
+                                       data=inject_balance_formulas(staff_df))
+                        _invalidate_sheet_cache("Staff_Master")
                         st.success(
                             f"Successfully encashed {encash_days} AL days for {encash_user}.")
                         st.rerun()
@@ -6704,9 +7623,21 @@ def render_system_settings(is_admin=True):
         st.divider()
         st.markdown("#### 📄 Single Employee Statement Export")
         if scoped_staff_df is not None and not scoped_staff_df.empty:
-            export_user = st.selectbox(
-                "Select Employee for Detailed History Statement", scoped_staff_df["Name"].tolist(), key="sys_exp_user")
+            c_exp_u, c_exp_fy = st.columns([2, 2])
+            with c_exp_u:
+                export_user = st.selectbox(
+                    "Select Employee for Detailed History Statement",
+                    scoped_staff_df["Name"].tolist(),
+                    key="sys_exp_user",
+                )
+            with c_exp_fy:
+                stmt_fy_sel = render_fy_scope_selector(
+                    key="sys_stmt_fy_scope",
+                    label="📅 Select Financial Year (FY) for Statement History",
+                    include_all=True,
+                )
             user_record = scoped_staff_df[scoped_staff_df["Name"] == export_user].iloc[0]
+            active_fy_lbl = str(user_record.get("Active_FY", "")).strip() or get_current_financial_year_dates()[2]
             data = {
                 "Leave Type": ["Casual Leave (CL)", "Sick Leave (SL)", "Annual Leave (AL)", "Unpaid Leave (UL)"],
                 "Opening Balance": [user_record.get("Opening_CL", 0), user_record.get("Opening_SL", 0), user_record.get("Opening_AL", 0), user_record.get("Opening_UL", 0)],
@@ -6716,15 +7647,22 @@ def render_system_settings(is_admin=True):
             }
             stmt_df = pd.DataFrame(data)
             buffer_single = io.BytesIO()
-            req_df = load_leave_requests()
-            past_leaves = req_df[req_df["Name"] == export_user] if not req_df.empty else pd.DataFrame()
+            stmt_fy_yr = stmt_fy_sel["fy_year"] if isinstance(stmt_fy_sel, dict) else None
+            stmt_fy_label = stmt_fy_sel["label"] if isinstance(stmt_fy_sel, dict) else "Current FY"
+            fy_rec_stmt = load_fy_records(stmt_fy_yr)
+            req_df = fy_rec_stmt["leaves"]
+            past_leaves = (
+                req_df[req_df["Name"].astype(str).str.strip() == str(export_user).strip()]
+                if (req_df is not None and not req_df.empty and "Name" in req_df.columns)
+                else pd.DataFrame()
+            )
             from openpyxl import Workbook
             from openpyxl.styles import Font
             wb = Workbook()
             ws = wb.active
             ws.title = "Leave Statement"
             bold_font = Font(bold=True)
-            ws.append([f"Leave Status of {export_user}"])
+            ws.append([f"Leave Status of {export_user} (Active Ledger: {active_fy_lbl})"])
             ws.cell(row=1, column=1).font = bold_font
             headers_1 = ["Leave Type", "Opening Balance", "Addition", "Used", "Closing Balance"]
             ws.append(headers_1)
@@ -6733,20 +7671,32 @@ def render_system_settings(is_admin=True):
             ws.append([])
             ws.append([])
             start_row = 9
-            ws.append([f"Past Leave History of {export_user}"])
+            ws.append([f"Past Leave History of {export_user} — {stmt_fy_label} (FY Breakdown)"])
             ws.cell(row=start_row, column=1).font = bold_font
-            headers_2 = ["StartDate", "StartHalf", "EndDate", "EndHalf", "Application date", "Leave Type", "TotalDays", "Status", "CLBalance", "ALBalance", "SLBalance", "ULBalance"]
+            headers_2 = ["StartDate", "StartHalf", "EndDate", "EndHalf", "Application date", "Leave Type", "TotalDays", "FY_Split", "Status", "CLBalance", "ALBalance", "SLBalance", "ULBalance"]
             ws.append(headers_2)
             if not past_leaves.empty:
                 for _, r in past_leaves.iterrows():
+                    sd_p = _parse_cta_date(r.get("StartDate"))
+                    ed_p = _parse_cta_date(r.get("EndDate"))
+                    sd_str = sd_p.strftime("%Y-%m-%d") if sd_p is not None else str(r.get("StartDate", ""))
+                    ed_str = ed_p.strftime("%Y-%m-%d") if ed_p is not None else str(r.get("EndDate", ""))
+                    bdown_s = get_leave_fy_breakdown(sd_p or r.get("StartDate"), ed_p or r.get("EndDate"), r.get("TotalDays"))
+                    if len(bdown_s) > 1:
+                        split_note = " | ".join(f"{v['fy_label']}: {v['days']:g}d" for v in bdown_s.values())
+                    elif len(bdown_s) == 1:
+                        split_note = next(iter(bdown_s.values()))["fy_label"]
+                    else:
+                        split_note = active_fy_lbl
                     ws.append([
-                        r.get("StartDate", ""),
+                        sd_str,
                         r.get("StartHalf", ""),
-                        r.get("EndDate", ""),
+                        ed_str,
                         r.get("EndHalf", ""),
                         r.get("ApplicationDate", ""),
                         r.get("LeaveType", ""),
                         r.get("TotalDays", ""),
+                        split_note,
                         r.get("Status", ""),
                         r.get("CLBalance", ""),
                         r.get("ALBalance", ""),
@@ -6806,6 +7756,11 @@ def render_system_settings(is_admin=True):
     with tab_backup:
         st.subheader("💾 1-Click Complete System Backup")
         st.caption("Download an offline copy of your database (staff, balances, leave requests, and tours) in a single Excel file.")
+        include_archives_bk = st.checkbox(
+            "📦 Include Historical FY Archive Worksheets in Backup",
+            value=False,
+            key="chk_backup_include_archives",
+        )
         import io
         backup_buffer = io.BytesIO()
         with pd.ExcelWriter(backup_buffer, engine='openpyxl') as writer:
@@ -6813,8 +7768,8 @@ def render_system_settings(is_admin=True):
             sm_df = load_staff_master()
             lr_df = load_leave_requests()
             tr_df = load_tour_sanctions()
+            b_map = build_user_branch_map(u_df, sm_df) if not is_central_viewer else None
             if not is_central_viewer:
-                b_map = build_user_branch_map(u_df, sm_df)
                 u_df = filter_df_by_branches(u_df, allowed_branches, b_map, name_col="Name")
                 sm_df = filter_df_by_branches(sm_df, allowed_branches, b_map, name_col="Name")
                 lr_df = filter_df_by_branches(lr_df, allowed_branches, b_map, name_col="Name")
@@ -6827,6 +7782,17 @@ def render_system_settings(is_admin=True):
                 lr_df.to_excel(writer, sheet_name="LeaveRequests", index=False)
             if tr_df is not None:
                 tr_df.to_excel(writer, sheet_name="TourSanctions", index=False)
+            if include_archives_bk:
+                for arch_title in _resolve_archive_titles():
+                    kind_a, _ = _extract_fy_year_from_archive_title(arch_title)
+                    if not kind_a:
+                        continue
+                    arch_df = _read_cached_archive_sheet(arch_title)
+                    if arch_df is not None:
+                        if not is_central_viewer and b_map is not None:
+                            arch_df = filter_df_by_branches(arch_df, allowed_branches, b_map, name_col="Name")
+                        safe_sheet_name = str(arch_title)[:31]
+                        arch_df.to_excel(writer, sheet_name=safe_sheet_name, index=False)
         
         backup_buffer.seek(0)
         today_str = get_cta_today().strftime("%Y-%m-%d")
@@ -6932,31 +7898,95 @@ def render_organization_calendar(fy_year_override=None, leaves_override=None, to
     tours_df = filter_df_by_branches(tours_df, allowed_branches, branch_map, name_col="Name")
     if (df_requests is None or df_requests.empty) and (tours_df is None or tours_df.empty):
         st.info("No leave or tour data to display for the selected branch(es).")
-        return
+        if fy_year_override is None:
+            return
         
     year = st.session_state[cal_state_key].year
     month = st.session_state[cal_state_key].month
-    
-    events = {day: [] for day in range(1, 32)}
-    
-    iter_requests = df_requests if (include_leaves and df_requests is not None and not df_requests.empty) else pd.DataFrame()
-    for idx, row in iter_requests.iterrows():
+    month_start = date(year, month, 1)
+    month_end = date(year, month, calendar.monthrange(year, month)[1])
+
+    def _cal_parse_date(val):
+        _cta_fn = globals().get("_parse_cta_date")
+        if callable(_cta_fn):
+            return _cta_fn(val)
+        if val is None:
+            return None
+        if isinstance(val, datetime):
+            if getattr(val, "tzinfo", None) is not None:
+                return val.astimezone(CTA_TZ).date() if "CTA_TZ" in globals() else val.date()
+            return val.date()
+        if hasattr(val, "to_pydatetime"):
+            try:
+                if pd.isnull(val):
+                    return None
+                ts = val.to_pydatetime()
+                return ts.date() if ts is not None else None
+            except Exception:
+                return None
+        if isinstance(val, date):
+            return val
         try:
-            start_d = datetime.strptime(str(row['StartDate']).strip(), "%Y-%m-%d").date()
-            end_d = datetime.strptime(str(row['EndDate']).strip(), "%Y-%m-%d").date()
-        except:
+            if pd.isnull(val):
+                return None
+        except Exception:
+            pass
+        s = str(val).strip()
+        if not s or s.lower() in ("nan", "none", "nat", "null"):
+            return None
+        for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y", "%d/%m/%Y", "%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S"):
+            try:
+                return datetime.strptime(s, fmt).date()
+            except ValueError:
+                continue
+        try:
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00").replace("z", "+00:00"))
+            if dt.tzinfo is not None and "CTA_TZ" in globals():
+                return dt.astimezone(CTA_TZ).date()
+            return dt.date()
+        except Exception:
+            pass
+        if len(s) >= 10:
+            for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y", "%d/%m/%Y"):
+                try:
+                    return datetime.strptime(s[:10], fmt).date()
+                except ValueError:
+                    continue
+        return None
+
+    def _cal_parse_series(series):
+        return [_cal_parse_date(v) for v in series.tolist()]
+
+    events = {day: [] for day in range(1, 32)}
+
+    iter_requests = df_requests if (include_leaves and df_requests is not None and not df_requests.empty) else pd.DataFrame()
+    if not iter_requests.empty:
+        if "Status" in iter_requests.columns:
+            iter_requests = iter_requests[iter_requests["Status"].astype(str).str.strip() != "Rejected"]
+        if not iter_requests.empty and "StartDate" in iter_requests.columns and "EndDate" in iter_requests.columns:
+            sd_list = _cal_parse_series(iter_requests["StartDate"])
+            ed_list = _cal_parse_series(iter_requests["EndDate"])
+            keep_l = [
+                (sd is not None and ed is not None and sd <= month_end and ed >= month_start)
+                for sd, ed in zip(sd_list, ed_list)
+            ]
+            iter_requests = iter_requests.loc[keep_l]
+    for idx, row in iter_requests.iterrows():
+        start_d = _cal_parse_date(row.get('StartDate'))
+        end_d = _cal_parse_date(row.get('EndDate'))
+        if start_d is None or end_d is None or start_d > month_end or end_d < month_start:
             continue
-            
+
         status = str(row.get('Status', '')).strip()
         if status == "Rejected":
             continue
-            
+
         name = str(row.get('Name', '')).strip()
         l_type = str(row.get('LeaveType', '')).strip()
-        
+
         is_reversal = l_type.startswith("Return-") or l_type.startswith("Rev-")
         display_type = l_type if not is_reversal else f"Rev-{l_type.replace('Return-', '').replace('Rev-', '')}"
-        
+
         if status == "Cancelled":
             bg = "#e0e0e0"
             color = "#777"
@@ -6976,59 +8006,81 @@ def render_organization_calendar(fy_year_override=None, leaves_override=None, to
                 border = "1px solid #388E3C"
             color = "white"
             text_decor = "none"
-            
-        curr_d = start_d
-        while curr_d <= end_d:
-            if curr_d.year == year and curr_d.month == month:
-                day = curr_d.day
-                
-                is_half = False
-                align = "center"
-                grad = ""
-                
-                sh = str(row.get('StartHalf', ''))
-                eh = str(row.get('EndHalf', ''))
-                
-                if curr_d == start_d and "Morning" in sh:
-                    is_half = True
-                    align = "left"
-                    grad = f"background: linear-gradient(to right, {bg} 50%, transparent 50%); border-left: {border};"
-                elif curr_d == start_d and "Evening" in sh:
-                    is_half = True
-                    align = "right"
-                    grad = f"background: linear-gradient(to left, {bg} 50%, transparent 50%); border-right: {border};"
-                elif curr_d == end_d and "Morning" in eh:
-                    is_half = True
-                    align = "left"
-                    grad = f"background: linear-gradient(to right, {bg} 50%, transparent 50%); border-left: {border};"
-                elif curr_d == end_d and "Evening" in eh:
-                    is_half = True
-                    align = "right"
-                    grad = f"background: linear-gradient(to left, {bg} 50%, transparent 50%); border-right: {border};"
-                
-                event_txt = f"{name} - {display_type}"
-                if is_half:
-                    half_str = str(row.get('StartHalf') if curr_d == start_d else row.get('EndHalf'))
-                    if "Morning" in half_str:
-                        h_char = "Mor"
-                    elif "Evening" in half_str:
-                        h_char = "Eve"
-                    else:
-                        h_char = "Half"
-                    event_txt += f" ({h_char})"
-                
-                if is_half:
-                    style = f"{grad} color: #333; text-decoration: {text_decor}; font-size: 0.75em; padding: 2px 4px; margin-bottom: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; border-radius: 2px; text-align: {align};"
+
+        curr_d = max(start_d, month_start)
+        loop_end = min(end_d, month_end)
+        while curr_d <= loop_end:
+            day = curr_d.day
+
+            is_half = False
+            align = "center"
+            grad = ""
+
+            sh = str(row.get('StartHalf', ''))
+            eh = str(row.get('EndHalf', ''))
+
+            if curr_d == start_d and "Morning" in sh:
+                is_half = True
+                align = "left"
+                grad = f"background: linear-gradient(to right, {bg} 50%, transparent 50%); border-left: {border};"
+            elif curr_d == start_d and "Evening" in sh:
+                is_half = True
+                align = "right"
+                grad = f"background: linear-gradient(to left, {bg} 50%, transparent 50%); border-right: {border};"
+            elif curr_d == end_d and "Morning" in eh:
+                is_half = True
+                align = "left"
+                grad = f"background: linear-gradient(to right, {bg} 50%, transparent 50%); border-left: {border};"
+            elif curr_d == end_d and "Evening" in eh:
+                is_half = True
+                align = "right"
+                grad = f"background: linear-gradient(to left, {bg} 50%, transparent 50%); border-right: {border};"
+
+            event_txt = f"{name} - {display_type}"
+            if is_half:
+                half_str = str(row.get('StartHalf') if curr_d == start_d else row.get('EndHalf'))
+                if "Morning" in half_str:
+                    h_char = "Mor"
+                elif "Evening" in half_str:
+                    h_char = "Eve"
                 else:
-                    style = f"background: {bg}; color: {color}; border: {border}; text-decoration: {text_decor}; font-size: 0.75em; padding: 2px 4px; margin-bottom: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; border-radius: 2px; text-align: center;"
-                
-                events[day].append(f'<div style="{style}" title="{status}">{event_txt}</div>')
-                
+                    h_char = "Half"
+                event_txt += f" ({h_char})"
+
+            if is_half:
+                style = f"{grad} color: #333; text-decoration: {text_decor}; font-size: 0.75em; padding: 2px 4px; margin-bottom: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; border-radius: 2px; text-align: {align};"
+            else:
+                style = f"background: {bg}; color: {color}; border: {border}; text-decoration: {text_decor}; font-size: 0.75em; padding: 2px 4px; margin-bottom: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; border-radius: 2px; text-align: center;"
+
+            events[day].append(f'<div style="{style}" title="{status}">{event_txt}</div>')
+
             curr_d += timedelta(days=1)
 
     # Map Official Tours on Calendar (already filtered by allowed_branches above)
     if include_tours and tours_df is not None and not tours_df.empty:
-        for idx, row in tours_df.iterrows():
+        tour_iter = tours_df
+        if "Status" in tour_iter.columns:
+            tour_iter = tour_iter[~tour_iter["Status"].astype(str).str.strip().isin(["Rejected", "Cancelled"])]
+        if not tour_iter.empty:
+            has_dep = "DepartureDate" in tour_iter.columns
+            has_arr = "ArrivalDate" in tour_iter.columns
+            dep_list = _cal_parse_series(tour_iter["DepartureDate"]) if has_dep else [None] * len(tour_iter)
+            arr_list = _cal_parse_series(tour_iter["ArrivalDate"]) if has_arr else [None] * len(tour_iter)
+            legs_col = tour_iter["TravelLegs"].tolist() if "TravelLegs" in tour_iter.columns else [""] * len(tour_iter)
+            keep_t = []
+            for dd, ad, raw_l in zip(dep_list, arr_list, legs_col):
+                has_legs = (
+                    (isinstance(raw_l, list) and len(raw_l) > 0)
+                    or (isinstance(raw_l, str) and raw_l.strip().startswith("[") and len(raw_l.strip()) > 2)
+                )
+                if dd is not None and ad is not None:
+                    keep_t.append(dd <= month_end and ad >= month_start)
+                elif has_legs:
+                    keep_t.append(True)
+                else:
+                    keep_t.append(False)
+            tour_iter = tour_iter.loc[keep_t]
+        for idx, row in tour_iter.iterrows():
             status = str(row.get('Status', '')).strip()
             if status in ["Rejected", "Cancelled"]:
                 continue
@@ -7051,27 +8103,31 @@ def render_organization_calendar(fy_year_override=None, leaves_override=None, to
             if legs_list and len(legs_list) > 0:
                 for leg in legs_list:
                     try:
-                        start_d = datetime.strptime(str(leg.get('departure_date', '')).strip(), "%Y-%m-%d").date()
-                        end_d = datetime.strptime(str(leg.get('arrival_date', '')).strip(), "%Y-%m-%d").date()
+                        start_d = _cal_parse_date(leg.get('departure_date', ''))
+                        end_d = _cal_parse_date(leg.get('arrival_date', ''))
+                        if start_d is None or end_d is None or start_d > month_end or end_d < month_start:
+                            continue
                         dest = str(leg.get('destination', '')).strip()
                         t_txt = f"✈️ {name} ({dest})"
-                        curr_d = start_d
-                        while curr_d <= end_d:
-                            if curr_d.year == year and curr_d.month == month:
-                                events[curr_d.day].append(f'<div style="{t_style}" title="Tour: {status}">{t_txt}</div>')
+                        curr_d = max(start_d, month_start)
+                        loop_end = min(end_d, month_end)
+                        while curr_d <= loop_end:
+                            events[curr_d.day].append(f'<div style="{t_style}" title="Tour: {status}">{t_txt}</div>')
                             curr_d += timedelta(days=1)
                     except Exception:
                         pass
             else:
                 try:
-                    start_d = datetime.strptime(str(row['DepartureDate']).strip(), "%Y-%m-%d").date()
-                    end_d = datetime.strptime(str(row['ArrivalDate']).strip(), "%Y-%m-%d").date()
+                    start_d = _cal_parse_date(row.get('DepartureDate'))
+                    end_d = _cal_parse_date(row.get('ArrivalDate'))
+                    if start_d is None or end_d is None or start_d > month_end or end_d < month_start:
+                        continue
                     dest = str(row.get('Destination', '')).strip()
                     t_txt = f"✈️ {name} ({dest})"
-                    curr_d = start_d
-                    while curr_d <= end_d:
-                        if curr_d.year == year and curr_d.month == month:
-                            events[curr_d.day].append(f'<div style="{t_style}" title="Tour: {status}">{t_txt}</div>')
+                    curr_d = max(start_d, month_start)
+                    loop_end = min(end_d, month_end)
+                    while curr_d <= loop_end:
+                        events[curr_d.day].append(f'<div style="{t_style}" title="Tour: {status}">{t_txt}</div>')
                         curr_d += timedelta(days=1)
                 except Exception:
                     continue
@@ -7186,22 +8242,55 @@ def render_active_leaves_banner(show_type=True):
     users_df = load_users_data()
     role_map = {}
     if users_df is not None and not users_df.empty and "Name" in users_df.columns and "Role" in users_df.columns:
-        for _, u_r in users_df.iterrows():
-            nm = str(u_r.get("Name", "")).strip()
+        for raw_nm, raw_rl in zip(users_df["Name"].tolist(), users_df["Role"].tolist()):
+            nm = str(raw_nm).strip() if pd.notnull(raw_nm) else ""
             if nm:
-                role_map[nm] = str(u_r.get("Role", "")).strip()
+                role_map[nm] = str(raw_rl).strip() if pd.notnull(raw_rl) else ""
 
-    df = filter_active_banner_records(load_leave_requests(), viewer_role, viewer_branch, allowed_branches, branch_map, role_map)
-    tours_df = filter_active_banner_records(load_tour_sanctions(), viewer_role, viewer_branch, allowed_branches, branch_map, role_map)
-    today_str = get_cta_today().strftime("%Y-%m-%d")
+    today_d = get_cta_today()
+    _parse_d_fn = globals().get("_parse_cta_date") or globals().get("_parse_leave_date")
+
+    def _banner_parse_series(series):
+        fast = pd.to_datetime(series, format="%Y-%m-%d", errors="coerce").dt.date
+        out = []
+        for raw_v, fv in zip(series.tolist(), fast.tolist()):
+            if fv is not None and not pd.isna(fv):
+                out.append(fv)
+            elif callable(_parse_d_fn):
+                out.append(_parse_d_fn(raw_v))
+            else:
+                out.append(None)
+        return out
+
+    raw_leaves = load_leave_requests()
+    if raw_leaves is not None and not raw_leaves.empty and "Status" in raw_leaves.columns and "StartDate" in raw_leaves.columns and "EndDate" in raw_leaves.columns:
+        raw_leaves = raw_leaves[raw_leaves["Status"].astype(str).str.strip() == "Approved"]
+        if not raw_leaves.empty:
+            sd_l = _banner_parse_series(raw_leaves["StartDate"])
+            ed_l = _banner_parse_series(raw_leaves["EndDate"])
+            keep_l = [(sd is not None and ed is not None and sd <= today_d <= ed) for sd, ed in zip(sd_l, ed_l)]
+            raw_leaves = raw_leaves.loc[keep_l]
+    df = filter_active_banner_records(raw_leaves, viewer_role, viewer_branch, allowed_branches, branch_map, role_map)
+
+    raw_tours = load_tour_sanctions()
+    if raw_tours is not None and not raw_tours.empty and "Status" in raw_tours.columns and "DepartureDate" in raw_tours.columns and "ArrivalDate" in raw_tours.columns:
+        raw_tours = raw_tours[raw_tours["Status"].astype(str).str.strip().isin(["Sanctioned", "Completed", "Settled"])]
+        if not raw_tours.empty:
+            dd_l = _banner_parse_series(raw_tours["DepartureDate"])
+            ad_l = _banner_parse_series(raw_tours["ArrivalDate"])
+            keep_t = [(dd is not None and ad is not None and dd <= today_d <= ad) for dd, ad in zip(dd_l, ad_l)]
+            raw_tours = raw_tours.loc[keep_t]
+    tours_df = filter_active_banner_records(raw_tours, viewer_role, viewer_branch, allowed_branches, branch_map, role_map)
 
     active_items = []
     if df is not None and not df.empty:
         for idx, row in df.iterrows():
-            if row.get("Status") == "Approved":
+            if str(row.get("Status", "")).strip() == "Approved":
                 start = str(row.get("StartDate", ""))
                 end = str(row.get("EndDate", ""))
-                if start <= today_str <= end:
+                s_d = _parse_d_fn(start) if callable(_parse_d_fn) else None
+                e_d = _parse_d_fn(end) if callable(_parse_d_fn) else None
+                if s_d is not None and e_d is not None and s_d <= today_d <= e_d:
                     start_half = str(row.get("StartHalf", "Full Day")).strip()
                     end_half = str(row.get("EndHalf", "Full Day")).strip()
                     if start_half == end_half:
@@ -7225,7 +8314,9 @@ def render_active_leaves_banner(show_type=True):
             if str(row.get("Status", "")).strip() in ["Sanctioned", "Completed", "Settled"]:
                 start = str(row.get("DepartureDate", ""))
                 end = str(row.get("ArrivalDate", ""))
-                if start <= today_str <= end:
+                s_d = _parse_d_fn(start) if callable(_parse_d_fn) else None
+                e_d = _parse_d_fn(end) if callable(_parse_d_fn) else None
+                if s_d is not None and e_d is not None and s_d <= today_d <= e_d:
                     emp_name = str(row['Name']).strip()
                     emp_role = role_map.get(emp_name, "")
                     is_other_branch_leadership = (
@@ -7279,14 +8370,32 @@ def branch_manager_dashboard():
 
     # --- TAB 1: BRANCH LEAVE APPROVALS ---
     with tab_bm_approvals:
+        df_requests = load_leave_requests()
+        tours_df_raw = load_tour_sanctions()
+        bm_fy_sel = render_fy_scope_selector(
+            key="bm_fy_scope",
+            label="📅 Select Financial Year (FY) Scope for Branch Leaves & Tours",
+            include_all=True,
+            leave_df=df_requests,
+            tour_df=tours_df_raw,
+        )
+        bm_fy_yr = bm_fy_sel["fy_year"] if isinstance(bm_fy_sel, dict) else None
+        bm_fy_records = load_fy_records(bm_fy_yr, leave_df_active=df_requests, tour_df_active=tours_df_raw)
+        bm_scoped_leaves = bm_fy_records["leaves"]
+        bm_scoped_tours = bm_fy_records["tours"]
+
         with st.expander("📅 View Organization Calendar", expanded=False):
-            render_organization_calendar()
+            render_organization_calendar(
+                fy_year_override=bm_fy_yr,
+                leaves_override=bm_scoped_leaves,
+                tours_override=bm_scoped_tours,
+            )
 
         with st.expander("🌐 Other Branches & Office Leave Availability (Co-Admin View)", expanded=False):
             bm_org_branches = render_branch_filter_checkboxes(key_prefix="bm_org_avail")
             bm_org_bmap = get_user_branch_map()
             st.caption(f"🔎 Showing leave & availability overview for: **{format_branch_scope(bm_org_branches)}**")
-            df_req_bm_org = load_leave_requests()
+            df_req_bm_org = bm_scoped_leaves
             if df_req_bm_org is not None and not df_req_bm_org.empty:
                 bm_overview = filter_df_by_branches(
                     df_req_bm_org[df_req_bm_org["Status"].isin(["Pending", "Approved"])],
@@ -7295,7 +8404,6 @@ def branch_manager_dashboard():
                     name_col="Name",
                 )
                 if not bm_overview.empty:
-                    bm_overview = bm_overview.iloc[::-1]
                     if "page_bm_org" not in st.session_state:
                         st.session_state.page_bm_org = 0
                     bm_per_page = 10
@@ -7310,8 +8418,8 @@ def branch_manager_dashboard():
                         ov_br = bm_org_bmap.get(str(ov_row["Name"]).strip(), "HQ")
                         oc1.write(f"**{ov_row['Name']}** ({ov_br}) - {ov_row['LeaveType']} ({ov_row['StartDate']} to {ov_row['EndDate']}) - {ov_row['Status']}")
                         if ov_row["Status"] == "Approved":
-                            pdf_b_ov = generate_leave_pdf(ov_row)
                             if oc2.button("📄 Preview PDF", key=f"prev_bm_org_{ov_row['ID']}"):
+                                pdf_b_ov = generate_leave_pdf(ov_row)
                                 open_pdf_dialog(pdf_b_ov, f"{ov_row['Name']}_{ov_row['StartDate']}_Leave.pdf")
                     st.divider()
                     bp1, bp2, bp3 = st.columns([1, 2, 1])
@@ -7336,13 +8444,12 @@ def branch_manager_dashboard():
         st.subheader(f"Pending Leave Requests from {bm_branch} Staff")
         st.caption(f"As Branch Manager, you have direct sanctioning authority for leaves submitted by {bm_branch} employees and accounts.")
 
-        df_requests = load_leave_requests()
         staff_df = load_staff_master()
 
-        if df_requests is not None and not df_requests.empty and "Status" in df_requests.columns:
-            pending_branch_leaves = df_requests[
-                (df_requests["Name"].isin(branch_staff_names)) &
-                (df_requests["Status"].astype(str).str.strip() == "Pending")
+        if bm_scoped_leaves is not None and not bm_scoped_leaves.empty and "Status" in bm_scoped_leaves.columns:
+            pending_branch_leaves = bm_scoped_leaves[
+                (bm_scoped_leaves["Name"].isin(branch_staff_names)) &
+                (bm_scoped_leaves["Status"].astype(str).str.strip() == "Pending")
             ]
 
             if pending_branch_leaves.empty:
@@ -7350,6 +8457,7 @@ def branch_manager_dashboard():
             else:
                 st.warning(f"🔔 You have {len(pending_branch_leaves)} pending leave request(s) from your branch staff.")
                 for idx, row in pending_branch_leaves.iterrows():
+                    is_bm_row_act = _is_active_sheet_row(row)
                     with st.expander(f"🍃 {row['Name']} — {row['LeaveType']} ({row['TotalDays']} Day(s))", expanded=True):
                         c_inf1, c_inf2 = st.columns([3, 2])
                         with c_inf1:
@@ -7367,18 +8475,20 @@ def branch_manager_dashboard():
                             b2.metric("SL", f"{emp_bal.get('SL', 0):g}d")
                             b3.metric("AL", f"{emp_bal.get('AL', 0):g}d")
 
-                        pdf_bytes = generate_leave_pdf(row)
-                        if pdf_bytes:
-                            if st.button("📄 Preview Official Leave Form (PDF)", key=f"prev_bm_pend_{row['ID']}"):
+                        if st.button("📄 Preview Official Leave Form (PDF)", key=f"prev_bm_pend_{row['ID']}"):
+                            pdf_bytes = generate_leave_pdf(row)
+                            if pdf_bytes:
                                 open_pdf_dialog(pdf_bytes, f"{row['Name']}_Leave_Preview.pdf")
 
                         c_app, c_rej = st.columns(2)
                         with c_app:
-                            if st.button("✅ Approve Leave", type="primary", key=f"bm_app_{row['ID']}", use_container_width=True):
+                            if st.button("✅ Approve Leave", type="primary", key=f"bm_app_{row['ID']}", use_container_width=True, disabled=not is_bm_row_act):
                                 with st.spinner("Approving leave & updating balances..."):
-                                    df_requests.at[idx, "Status"] = "Approved"
-                                    df_requests.at[idx, "ApprovedBy"] = f"{bm_name} (Branch Manager)"
-                                    conn.update(worksheet="LeaveRequests", data=df_requests)
+                                    act_m = df_requests[df_requests["ID"].map(_normalize_record_id) == _normalize_record_id(row["ID"])].index
+                                    if not act_m.empty:
+                                        df_requests.loc[act_m, "Status"] = "Approved"
+                                        df_requests.loc[act_m, "ApprovedBy"] = f"{bm_name} (Branch Manager)"
+                                        _gsheets_retry(conn.update, worksheet="LeaveRequests", data=df_requests)
 
                                     if staff_df is not None:
                                         employee_idx = staff_df[staff_df["Name"] == row["Name"]].index
@@ -7387,8 +8497,8 @@ def branch_manager_dashboard():
                                             leave_type = str(row["LeaveType"]).replace("Return-", "")
                                             tot_days = float(row["TotalDays"]) if pd.notnull(row["TotalDays"]) else 0.0
                                             try:
-                                                l_start = pd.to_datetime(row["StartDate"]).date()
-                                                l_end = pd.to_datetime(row["EndDate"]).date()
+                                                l_start = _parse_cta_date(row["StartDate"]) or pd.to_datetime(row["StartDate"]).date()
+                                                l_end = _parse_cta_date(row["EndDate"]) or pd.to_datetime(row["EndDate"]).date()
                                                 bdown = get_leave_fy_breakdown(l_start, l_end, tot_days)
                                                 cur_fy_s, _, _ = get_current_financial_year_dates()
                                                 if bdown:
@@ -7440,9 +8550,9 @@ def branch_manager_dashboard():
                                                 c_ul = sf_bm(staff_df.at[e_idx, "Cumulative_UL"]) if "Cumulative_UL" in staff_df.columns else 0.0
                                                 staff_df.at[e_idx, penalty_col] = eff + curr_eff + u_ul + c_ul
 
-                                            conn.update(worksheet="Staff_Master", data=inject_balance_formulas(staff_df))
+                                            _gsheets_retry(conn.update, worksheet="Staff_Master", data=inject_balance_formulas(staff_df))
 
-                                    st.cache_data.clear()
+                                    _invalidate_sheet_cache("LeaveRequests", "Staff_Master")
                                     emp_top = get_user_ntfy_topic(row['Name'])
                                     if emp_top:
                                         send_ntfy_notification(
@@ -7459,12 +8569,14 @@ def branch_manager_dashboard():
                                     st.rerun()
 
                         with c_rej:
-                            if st.button("❌ Reject Leave", key=f"bm_rej_{row['ID']}", use_container_width=True):
+                            if st.button("❌ Reject Leave", key=f"bm_rej_{row['ID']}", use_container_width=True, disabled=not is_bm_row_act):
                                 with st.spinner("Rejecting leave..."):
-                                    df_requests.at[idx, "Status"] = "Rejected"
-                                    df_requests.at[idx, "ApprovedBy"] = f"Rejected by Branch Manager {bm_name}"
-                                    conn.update(worksheet="LeaveRequests", data=df_requests)
-                                    st.cache_data.clear()
+                                    act_m = df_requests[df_requests["ID"].map(_normalize_record_id) == _normalize_record_id(row["ID"])].index
+                                    if not act_m.empty:
+                                        df_requests.loc[act_m, "Status"] = "Rejected"
+                                        df_requests.loc[act_m, "ApprovedBy"] = f"Rejected by Branch Manager {bm_name}"
+                                        _gsheets_retry(conn.update, worksheet="LeaveRequests", data=df_requests)
+                                        _invalidate_sheet_cache("LeaveRequests")
                                     emp_top = get_user_ntfy_topic(row['Name'])
                                     if emp_top:
                                         send_ntfy_notification(
@@ -7477,15 +8589,15 @@ def branch_manager_dashboard():
 
             st.divider()
             st.subheader(f"Historical Leaves for {bm_branch} Staff")
-            branch_hist_leaves = df_requests[
-                (df_requests["Name"].isin(branch_staff_names)) &
-                (df_requests["Status"].astype(str).str.strip().isin(["Approved", "Rejected", "Cancelled"]))
-            ].iloc[::-1]
+            branch_hist_leaves = bm_scoped_leaves[
+                (bm_scoped_leaves["Name"].isin(branch_staff_names)) &
+                (bm_scoped_leaves["Status"].astype(str).str.strip().isin(["Approved", "Rejected", "Cancelled"]))
+            ]
 
             if branch_hist_leaves.empty:
                 st.caption("No processed leave history for this branch yet.")
             else:
-                disp_h = [c for c in ["Name", "LeaveType", "TotalDays", "StartDate", "EndDate", "Status", "ApprovedBy"] if c in branch_hist_leaves.columns]
+                disp_h = [c for c in ["ID", "Name", "LeaveType", "TotalDays", "StartDate", "EndDate", "Status", "ApprovedBy"] if c in branch_hist_leaves.columns]
                 st.dataframe(branch_hist_leaves[disp_h], use_container_width=True)
         else:
             st.info("No leave requests found.")
@@ -7495,11 +8607,11 @@ def branch_manager_dashboard():
         st.subheader(f"✈️ Official Tour Sanctions for {branch_full_name} ({bm_branch}) Staff")
         st.caption(f"As Branch Manager, you have direct sanctioning authority for official duty travel submitted by {bm_branch} staff.")
 
-        tours_df = load_tour_sanctions()
-        if tours_df is not None and not tours_df.empty:
-            branch_tours = tours_df[
-                (tours_df["Name"].isin(branch_staff_names)) |
-                ((tours_df["Branch"].apply(normalize_branch_code) == bm_branch) & (tours_df["Name"] != bm_name))
+        tours_df = tours_df_raw
+        if bm_scoped_tours is not None and not bm_scoped_tours.empty:
+            branch_tours = bm_scoped_tours[
+                (bm_scoped_tours["Name"].isin(branch_staff_names)) |
+                ((bm_scoped_tours["Branch"].apply(normalize_branch_code) == bm_branch) & (bm_scoped_tours["Name"] != bm_name))
             ]
 
             pending_branch_tours = branch_tours[
@@ -7513,6 +8625,7 @@ def branch_manager_dashboard():
             else:
                 st.warning(f"🔔 You have {len(pending_branch_tours)} tour sanction request(s) waiting for review from your branch staff.")
                 for idx, tr in pending_branch_tours.iterrows():
+                    is_bm_tr_act = _is_active_sheet_row(tr)
                     with st.expander(f"✈️ {tr['Name']} — Tour to {tr['Destination']} ({tr['TotalDays']} Day(s))", expanded=True):
                         st.write(f"**Travel Dates:** {tr['DepartureDate']} to {tr['ArrivalDate']}")
                         st.write(f"**Conveyance:** {tr.get('ConveyanceMode', 'Road')}")
@@ -7558,9 +8671,9 @@ def branch_manager_dashboard():
                         if supp_by and supp_by not in ['nan', 'None', '', 'N/A (Direct Application)']:
                             st.success(f"✅ Endorsed by Co-Admin: **{supp_by}**")
 
-                        pdf_data = generate_tour_sanction_pdf(tr)
-                        if pdf_data:
-                            if st.button("📄 Preview Official Tour Form (PDF)", key=f"prev_tr_bm_{tr['ID']}"):
+                        if st.button("📄 Preview Official Tour Form (PDF)", key=f"prev_tr_bm_{tr['ID']}"):
+                            pdf_data = generate_tour_sanction_pdf(tr)
+                            if pdf_data:
                                 open_pdf_dialog(pdf_data, f"{tr['Name']}_Tour_Preview.pdf")
 
                         assigned_adm = str(tr.get("SelectedAdmin", "")).strip()
@@ -7572,16 +8685,18 @@ def branch_manager_dashboard():
                         else:
                             c_sup, c_rej = st.columns(2)
                             with c_sup:
-                                if st.button("🤝 Support", type="primary", key=f"bm_sup_btn_{tr['ID']}", use_container_width=True):
+                                if st.button("🤝 Support", type="primary", key=f"bm_sup_btn_{tr['ID']}", use_container_width=True, disabled=not is_bm_tr_act):
                                     with st.spinner("Supporting Tour & Forwarding..."):
-                                        tours_df.at[idx, "BMSupportedBy"] = bm_name
+                                        act_tm = tours_df[tours_df["ID"].map(_normalize_record_id) == _normalize_record_id(tr["ID"])].index
                                         if sel_co and sel_co not in ["Not-Applicable", "N/A", "nan", "None", ""]:
                                             next_status = "Pending Co-Admin Support"
                                         else:
                                             next_status = "Pending Admin Sanction"
-                                        tours_df.at[idx, "Status"] = next_status
-                                        conn.update(worksheet="TourSanctions", data=tours_df)
-                                        st.cache_data.clear()
+                                        if not act_tm.empty:
+                                            tours_df.loc[act_tm, "BMSupportedBy"] = bm_name
+                                            tours_df.loc[act_tm, "Status"] = next_status
+                                            _gsheets_retry(conn.update, worksheet="TourSanctions", data=tours_df)
+                                            _invalidate_sheet_cache("TourSanctions")
 
                                         emp_top = get_user_ntfy_topic(tr['Name'])
                                         acct_topics = get_branch_accounts_topics(bm_branch)
@@ -7622,13 +8737,15 @@ def branch_manager_dashboard():
                                         st.rerun()
 
                             with c_rej:
-                                if st.button("❌ Reject Tour", key=f"bm_rej_btn_{tr['ID']}", use_container_width=True):
+                                if st.button("❌ Reject Tour", key=f"bm_rej_btn_{tr['ID']}", use_container_width=True, disabled=not is_bm_tr_act):
                                     with st.spinner("Rejecting Tour..."):
-                                        tours_df.at[idx, "Status"] = "Rejected"
-                                        tours_df.at[idx, "ApprovedBy"] = f"Rejected by Branch Manager {bm_name}"
-                                        tours_df.at[idx, "SanctionedBy"] = f"Rejected by Branch Manager {bm_name}"
-                                        conn.update(worksheet="TourSanctions", data=tours_df)
-                                        st.cache_data.clear()
+                                        act_tm = tours_df[tours_df["ID"].map(_normalize_record_id) == _normalize_record_id(tr["ID"])].index
+                                        if not act_tm.empty:
+                                            tours_df.loc[act_tm, "Status"] = "Rejected"
+                                            tours_df.loc[act_tm, "ApprovedBy"] = f"Rejected by Branch Manager {bm_name}"
+                                            tours_df.loc[act_tm, "SanctionedBy"] = f"Rejected by Branch Manager {bm_name}"
+                                            _gsheets_retry(conn.update, worksheet="TourSanctions", data=tours_df)
+                                            _invalidate_sheet_cache("TourSanctions")
 
                                         emp_top = get_user_ntfy_topic(tr['Name'])
                                         acct_topics = get_branch_accounts_topics(bm_branch)
@@ -7651,12 +8768,12 @@ def branch_manager_dashboard():
             st.subheader(f"Sanctioned & Historical Tours for {bm_branch} Staff")
             branch_hist_tours = branch_tours[
                 branch_tours["Status"].astype(str).str.strip().isin(["Sanctioned", "Completed", "Settled", "Rejected", "Cancelled"])
-            ].iloc[::-1]
+            ]
 
             if branch_hist_tours.empty:
                 st.caption("No processed tour records for this branch yet.")
             else:
-                disp_t_cols = [c for c in ["Name", "Destination", "DepartureDate", "ArrivalDate", "TotalDays", "Status", "SanctionedBy", "ApprovedBy", "AccountsPunched"] if c in branch_hist_tours.columns]
+                disp_t_cols = [c for c in ["ID", "Name", "Destination", "DepartureDate", "ArrivalDate", "TotalDays", "Status", "SanctionedBy", "ApprovedBy", "AccountsPunched"] if c in branch_hist_tours.columns]
                 st.dataframe(branch_hist_tours[disp_t_cols], use_container_width=True)
         else:
             st.info("No tour records found.")
@@ -7719,8 +8836,26 @@ def admin_dashboard():
         render_system_settings(is_admin=True)
         
     with tab1:
+        df_requests = load_leave_requests()
+        tours_df_adm_raw = load_tour_sanctions()
+        adm_fy_sel = render_fy_scope_selector(
+            key="admin_fy_scope",
+            label="📅 Select Financial Year (FY) Scope for Leaves & Tours",
+            include_all=True,
+            leave_df=df_requests,
+            tour_df=tours_df_adm_raw,
+        )
+        adm_fy_yr = adm_fy_sel["fy_year"] if isinstance(adm_fy_sel, dict) else None
+        adm_fy_records = load_fy_records(adm_fy_yr, leave_df_active=df_requests, tour_df_active=tours_df_adm_raw)
+        adm_scoped_leaves = adm_fy_records["leaves"]
+        adm_scoped_tours = adm_fy_records["tours"]
+
         with st.expander("📅 View Organization Calendar", expanded=False):
-            render_organization_calendar()
+            render_organization_calendar(
+                fy_year_override=adm_fy_yr,
+                leaves_override=adm_scoped_leaves,
+                tours_override=adm_scoped_tours,
+            )
 
         allowed_branches_adm = get_active_visible_branches()
         branch_map_adm = get_user_branch_map()
@@ -7730,8 +8865,7 @@ def admin_dashboard():
         st.divider()
         staff_df = load_staff_master()
         st.subheader("Pending Approvals", anchor="pending-approvals")
-        df_requests = load_leave_requests()
-        if not df_requests.empty and "Status" in df_requests.columns:
+        if adm_scoped_leaves is not None and not adm_scoped_leaves.empty and "Status" in adm_scoped_leaves.columns:
             users_df = load_users_data()
             branch_subordinates = []
             if users_df is not None and not users_df.empty:
@@ -7741,15 +8875,16 @@ def admin_dashboard():
                 ]["Name"].tolist()
 
             # Admin approves HQ staff leaves and Branch Manager leaves (branch subordinates are approved by their Branch Manager)
-            pending_requests = df_requests[
-                (df_requests["Status"] == "Pending") &
-                (~df_requests["Name"].isin(branch_subordinates))
+            pending_requests = adm_scoped_leaves[
+                (adm_scoped_leaves["Status"] == "Pending") &
+                (~adm_scoped_leaves["Name"].isin(branch_subordinates))
             ]
             if pending_requests.empty:
                 st.info("No pending requests to approve. Good job!")
             else:
                 st.error(f"🔔 You have {len(pending_requests)} leave request(s) waiting for approval!")
                 for idx, row in pending_requests.iterrows():
+                    is_adm_pend_act = _is_active_sheet_row(row)
                     with st.expander(f"{row['Name']} - {row['LeaveType']} ({row['TotalDays']} days)"):
                         st.write(f"**Dates:** {row['StartDate']} to {row['EndDate']}")
                         st.write(f"**Department:** {row.get('Department', '')}")
@@ -7761,15 +8896,17 @@ def admin_dashboard():
                             st.caption(f"**Co-Admin ({co_admin_name}):** {co_status}")
                         else:
                             st.caption(f"**Co-Admin:** {co_status}")
-                        pdf_bytes = generate_leave_pdf(row)
                         if st.button("📄 Preview PDF", key=f"preview_pending_admin_{row['ID']}"):
+                            pdf_bytes = generate_leave_pdf(row)
                             open_pdf_dialog(pdf_bytes, f"{row['Name']}_{row['StartDate']}_Leave_Preview.pdf")
                         col1, col2 = st.columns(2)
-                        if col1.button("Approve", key=f"approve_{row['ID']}"):
+                        if col1.button("Approve", key=f"approve_{row['ID']}", disabled=not is_adm_pend_act):
                             with st.spinner('Processing... Please wait and do not click again.'):
-                                df_requests.at[idx, "Status"] = "Approved"
-                                df_requests.at[idx, "ApprovedBy"] = st.session_state.user_name
-                                conn.update(worksheet="LeaveRequests", data=df_requests)
+                                act_m = df_requests[df_requests["ID"].map(_normalize_record_id) == _normalize_record_id(row["ID"])].index
+                                if not act_m.empty:
+                                    df_requests.loc[act_m, "Status"] = "Approved"
+                                    df_requests.loc[act_m, "ApprovedBy"] = st.session_state.user_name
+                                    _gsheets_retry(conn.update, worksheet="LeaveRequests", data=df_requests)
                                 if staff_df is not None:
                                     employee_idx = staff_df[staff_df["Name"] == row["Name"]].index
                                     if not employee_idx.empty:
@@ -7778,8 +8915,8 @@ def admin_dashboard():
                                         actual_leave_type = leave_type.replace("Return-", "")
                                         tot_days = float(row["TotalDays"]) if pd.notnull(row["TotalDays"]) else 0.0
                                         try:
-                                            l_start = pd.to_datetime(row["StartDate"]).date()
-                                            l_end = pd.to_datetime(row["EndDate"]).date()
+                                            l_start = _parse_cta_date(row["StartDate"]) or pd.to_datetime(row["StartDate"]).date()
+                                            l_end = _parse_cta_date(row["EndDate"]) or pd.to_datetime(row["EndDate"]).date()
                                             bdown = get_leave_fy_breakdown(l_start, l_end, tot_days)
                                             cur_fy_s, _, _ = get_current_financial_year_dates()
                                             if bdown:
@@ -7828,8 +8965,8 @@ def admin_dashboard():
                                             u_ul = sf(staff_df.at[e_idx, "Used_UL"]) if "Used_UL" in staff_df.columns else 0.0
                                             c_ul = sf(staff_df.at[e_idx, "Cumulative_UL"]) if "Cumulative_UL" in staff_df.columns else 0.0
                                             staff_df.at[e_idx, penalty_col] = eff + curr_eff + u_ul + c_ul
-                                        conn.update(worksheet="Staff_Master", data=inject_balance_formulas(staff_df))
-                                st.cache_data.clear()
+                                        _gsheets_retry(conn.update, worksheet="Staff_Master", data=inject_balance_formulas(staff_df))
+                                _invalidate_sheet_cache("LeaveRequests", "Staff_Master")
                                 st.success(f"Approved {row['Name']}'s request!")
                                 # 1. Notify Employee (Applicant)
                                 emp_top = get_user_ntfy_topic(row['Name'])
@@ -7856,11 +8993,13 @@ def admin_dashboard():
                                             f"Admin approved {row['TotalDays']} day(s) of leave for {row['Name']}."
                                         )
                                 st.rerun()
-                        if col2.button("Reject", key=f"reject_{row['ID']}"):
+                        if col2.button("Reject", key=f"reject_{row['ID']}", disabled=not is_adm_pend_act):
                             with st.spinner('Processing... Please wait and do not click again.'):
-                                df_requests.at[idx, "Status"] = "Rejected"
-                                conn.update(worksheet="LeaveRequests", data=df_requests)
-                                st.cache_data.clear()
+                                act_m = df_requests[df_requests["ID"].map(_normalize_record_id) == _normalize_record_id(row["ID"])].index
+                                if not act_m.empty:
+                                    df_requests.loc[act_m, "Status"] = "Rejected"
+                                    _gsheets_retry(conn.update, worksheet="LeaveRequests", data=df_requests)
+                                    _invalidate_sheet_cache("LeaveRequests")
                                 emp_top = get_user_ntfy_topic(row['Name'])
                                 if emp_top:
                                     send_ntfy_notification(
@@ -7875,14 +9014,12 @@ def admin_dashboard():
         if allowed_branches_adm:
             st.caption(f"🔎 Showing branches: **{format_branch_scope(allowed_branches_adm)}**")
         approved_requests = filter_df_by_branches(
-            df_requests[df_requests["Status"] == "Approved"],
+            adm_scoped_leaves[adm_scoped_leaves["Status"] == "Approved"] if (adm_scoped_leaves is not None and not adm_scoped_leaves.empty and "Status" in adm_scoped_leaves.columns) else pd.DataFrame(),
             allowed_branches_adm,
             branch_map_adm,
             name_col="Name"
         )
-        if not approved_requests.empty:
-            approved_requests = approved_requests.iloc[::-1] # Reverse to show latest first
-            
+        if approved_requests is not None and not approved_requests.empty:
             if "page_admin" not in st.session_state:
                 st.session_state.page_admin = 0
                 
@@ -7899,21 +9036,24 @@ def admin_dashboard():
             current_page_df = approved_requests.iloc[start_idx:end_idx]
             
             for idx, row in current_page_df.iterrows():
+                is_adm_app_act = _is_active_sheet_row(row)
                 col1, col2, col3 = st.columns([3.5, 1.2, 1.5])
                 col1.write(f"**{row['Name']}** — {row['LeaveType']}: **{row['TotalDays']} Day(s)** ({row['StartDate']} to {row['EndDate']})")
-                pdf_bytes = generate_leave_pdf(row)
                 if col2.button("📄 Preview", key=f"prev_admin_{row['ID']}"):
+                    pdf_bytes = generate_leave_pdf(row)
                     open_pdf_dialog(pdf_bytes, f"{row['Name']}_{row['StartDate']}_Leave.pdf")
-                if col3.button("❌ Cancel & Refund", key=f"canc_adm_{row['ID']}", help="Cancel this approved leave and automatically restore days back to employee balance."):
+                if col3.button("❌ Cancel & Refund", key=f"canc_adm_{row['ID']}", disabled=not is_adm_app_act, help="Cancel this approved leave and automatically restore days back to employee balance."):
                     with st.spinner("Cancelling leave & refunding balance..."):
-                        df_requests.at[idx, "Status"] = "Cancelled"
-                        conn.update(worksheet="LeaveRequests", data=df_requests)
+                        act_m = df_requests[df_requests["ID"].map(_normalize_record_id) == _normalize_record_id(row["ID"])].index
+                        if not act_m.empty:
+                            df_requests.loc[act_m, "Status"] = "Cancelled"
+                            _gsheets_retry(conn.update, worksheet="LeaveRequests", data=df_requests)
                         e_name = row["Name"]
                         l_type = row["LeaveType"].replace("Return-", "")
                         l_days = float(row["TotalDays"]) if pd.notnull(row["TotalDays"]) else 0.0
                         try:
-                            l_start = pd.to_datetime(row["StartDate"]).date()
-                            l_end = pd.to_datetime(row["EndDate"]).date()
+                            l_start = _parse_cta_date(row["StartDate"]) or pd.to_datetime(row["StartDate"]).date()
+                            l_end = _parse_cta_date(row["EndDate"]) or pd.to_datetime(row["EndDate"]).date()
                             bdown = get_leave_fy_breakdown(l_start, l_end, l_days)
                             cur_fy_s, _, _ = get_current_financial_year_dates()
                             if bdown:
@@ -7971,8 +9111,8 @@ def admin_dashboard():
                                     c_ul = sf_c(staff_df.at[u_idx, "Cumulative_UL"]) if "Cumulative_UL" in staff_df.columns else 0.0
                                     staff_df.at[u_idx, penalty_col] = eff + curr_eff + u_ul + c_ul
 
-                                conn.update(worksheet="Staff_Master", data=inject_balance_formulas(staff_df))
-                        st.cache_data.clear()
+                                _gsheets_retry(conn.update, worksheet="Staff_Master", data=inject_balance_formulas(staff_df))
+                        _invalidate_sheet_cache("LeaveRequests", "Staff_Master")
                         emp_top = get_user_ntfy_topic(e_name)
                         if emp_top:
                             send_ntfy_notification(
@@ -8003,10 +9143,10 @@ def admin_dashboard():
     with tab_trs:
         st.subheader("Official Tour Sanctions (Final Approval Authority)", anchor="tour-sanctions-admin")
         st.caption("Central Admin holds sole sanctioning authority for official duty tours.")
-        tours_df = load_tour_sanctions()
-        if not tours_df.empty:
-            pending_tours = tours_df[
-                tours_df["Status"].astype(str).str.strip().isin([
+        tours_df = tours_df_adm_raw
+        if adm_scoped_tours is not None and not adm_scoped_tours.empty:
+            pending_tours = adm_scoped_tours[
+                adm_scoped_tours["Status"].astype(str).str.strip().isin([
                     "Pending Admin Sanction", "Pending Sanction", "Pending", 
                     "Pending Recommendation", "Pending Co-Admin Support", 
                     "Pending Branch Manager Support"
@@ -8017,6 +9157,7 @@ def admin_dashboard():
             else:
                 st.error(f"🔔 You have {len(pending_tours)} tour sanction request(s) waiting for approval!")
                 for idx, tr in pending_tours.iterrows():
+                    is_adm_tr_act = _is_active_sheet_row(tr)
                     with st.expander(f"✈️ {tr['Name']} — Tour to {tr['Destination']} ({tr['TotalDays']} Day(s))", expanded=True):
                         st.write(f"**Travel Dates:** {tr['DepartureDate']} to {tr['ArrivalDate']}")
                         st.write(f"**Conveyance:** {tr.get('ConveyanceMode', 'Road')}")
@@ -8071,18 +9212,20 @@ def admin_dashboard():
                         if assigned_adm and assigned_adm not in ['nan', 'None', '']:
                             st.caption(f"**Assigned Sanctioning Authority:** Admin {assigned_adm}")
                             
-                        pdf_data = generate_tour_sanction_pdf(tr)
-                        if pdf_data:
-                            if st.button("📄 Preview Tour PDF", key=f"prev_tr_admin_{tr['ID']}"):
+                        if st.button("📄 Preview Tour PDF", key=f"prev_tr_admin_{tr['ID']}"):
+                            pdf_data = generate_tour_sanction_pdf(tr)
+                            if pdf_data:
                                 open_pdf_dialog(pdf_data, f"{tr['Name']}_Tour_Preview.pdf")
                                 
                         c1, c2 = st.columns(2)
-                        if c1.button("Sanction Tour", type="primary", key=f"sanc_btn_{tr['ID']}"):
+                        if c1.button("Sanction Tour", type="primary", key=f"sanc_btn_{tr['ID']}", disabled=not is_adm_tr_act):
                             with st.spinner("Granting Official Tour Sanction..."):
-                                tours_df.at[idx, "Status"] = "Sanctioned"
-                                tours_df.at[idx, "ApprovedBy"] = st.session_state.user_name
-                                conn.update(worksheet="TourSanctions", data=tours_df)
-                                st.cache_data.clear()
+                                act_tm = tours_df[tours_df["ID"].map(_normalize_record_id) == _normalize_record_id(tr["ID"])].index
+                                if not act_tm.empty:
+                                    tours_df.loc[act_tm, "Status"] = "Sanctioned"
+                                    tours_df.loc[act_tm, "ApprovedBy"] = st.session_state.user_name
+                                    _gsheets_retry(conn.update, worksheet="TourSanctions", data=tours_df)
+                                    _invalidate_sheet_cache("TourSanctions")
                                 # 1. Notify Employee (Applicant)
                                 emp_top = get_user_ntfy_topic(tr['Name'])
                                 if emp_top:
@@ -8108,12 +9251,14 @@ def admin_dashboard():
                                 st.success(f"Sanctioned Tour for {tr['Name']}!")
                                 st.rerun()
                                 
-                        if c2.button("Reject Tour", key=f"rej_btn_admin_{tr['ID']}"):
+                        if c2.button("Reject Tour", key=f"rej_btn_admin_{tr['ID']}", disabled=not is_adm_tr_act):
                             with st.spinner("Rejecting Tour..."):
-                                tours_df.at[idx, "Status"] = "Rejected"
-                                tours_df.at[idx, "ApprovedBy"] = f"Rejected by {st.session_state.user_name}"
-                                conn.update(worksheet="TourSanctions", data=tours_df)
-                                st.cache_data.clear()
+                                act_tm = tours_df[tours_df["ID"].map(_normalize_record_id) == _normalize_record_id(tr["ID"])].index
+                                if not act_tm.empty:
+                                    tours_df.loc[act_tm, "Status"] = "Rejected"
+                                    tours_df.loc[act_tm, "ApprovedBy"] = f"Rejected by {st.session_state.user_name}"
+                                    _gsheets_retry(conn.update, worksheet="TourSanctions", data=tours_df)
+                                    _invalidate_sheet_cache("TourSanctions")
                                 emp_top = get_user_ntfy_topic(tr['Name'])
                                 if emp_top:
                                     send_ntfy_notification(
@@ -8129,21 +9274,44 @@ def admin_dashboard():
             if allowed_branches_adm:
                 st.caption(f"🔎 Showing branches: **{', '.join(allowed_branches_adm)}**")
             all_sanc = filter_df_by_branches(
-                tours_df[tours_df["Status"].isin(["Sanctioned", "Completed", "Settled"])],
+                adm_scoped_tours[adm_scoped_tours["Status"].isin(["Sanctioned", "Completed", "Settled"])],
                 allowed_branches_adm,
                 branch_map_adm,
                 name_col="Name"
-            ).iloc[::-1]
-            if all_sanc.empty:
+            )
+            if all_sanc is None or all_sanc.empty:
                 st.info("No sanctioned tours on record.")
             else:
-                for _, r in all_sanc.iterrows():
+                if "page_admin_tours" not in st.session_state:
+                    st.session_state.page_admin_tours = 0
+                tr_per_page = 10
+                tot_tr_items = len(all_sanc)
+                tot_tr_pages = max(1, (tot_tr_items - 1) // tr_per_page + 1)
+                if st.session_state.page_admin_tours >= tot_tr_pages:
+                    st.session_state.page_admin_tours = tot_tr_pages - 1
+                t_s_idx = st.session_state.page_admin_tours * tr_per_page
+                t_e_idx = t_s_idx + tr_per_page
+                for _, r in all_sanc.iloc[t_s_idx:t_e_idx].iterrows():
                     c_info, c_pdf = st.columns([5, 1])
                     c_info.write(f"**{r['Name']}** — Tour to **{r['Destination']}** ({r['DepartureDate']} to {r['ArrivalDate']}) — Status: {r['Status']}")
-                    pdf_bytes = generate_tour_sanction_pdf(r)
-                    if pdf_bytes:
-                        if c_pdf.button("📄 PDF", key=f"arch_tr_pdf_{r['ID']}"):
+                    if c_pdf.button("📄 PDF", key=f"arch_tr_pdf_{r['ID']}"):
+                        pdf_bytes = generate_tour_sanction_pdf(r)
+                        if pdf_bytes:
                             open_pdf_dialog(pdf_bytes, f"{r['Name']}_{r['DepartureDate']}_Tour.pdf")
+                if tot_tr_pages > 1:
+                    pt1, pt2, pt3 = st.columns([1, 2, 1])
+                    with pt1:
+                        if st.session_state.page_admin_tours > 0:
+                            if st.button("⬅️ Previous Tours", key="prev_admin_tr_btn"):
+                                st.session_state.page_admin_tours -= 1
+                                st.rerun()
+                    with pt2:
+                        st.markdown(f"<div style='text-align: center'>Tour Page {st.session_state.page_admin_tours + 1} of {tot_tr_pages}</div>", unsafe_allow_html=True)
+                    with pt3:
+                        if st.session_state.page_admin_tours < tot_tr_pages - 1:
+                            if st.button("Next Tours ➡️", key="next_admin_tr_btn"):
+                                st.session_state.page_admin_tours += 1
+                                st.rerun()
         else:
             st.info("No tour data available.")
 
@@ -8166,21 +9334,39 @@ def coadmin_dashboard():
     with tab_lv_sup:
         st.subheader("Leaves to Support", anchor="leaves-to-support")
         df_requests = load_leave_requests()
+        tours_df_co_raw = load_tour_sanctions()
+        co_fy_sel = render_fy_scope_selector(
+            key="coadmin_fy_scope",
+            label="📅 Select Financial Year (FY) Scope for Co-Admin Leaves & Tours",
+            include_all=True,
+            leave_df=df_requests,
+            tour_df=tours_df_co_raw,
+        )
+        co_fy_yr = co_fy_sel["fy_year"] if isinstance(co_fy_sel, dict) else None
+        co_fy_records = load_fy_records(co_fy_yr, leave_df_active=df_requests, tour_df_active=tours_df_co_raw)
+        co_scoped_leaves = co_fy_records["leaves"]
+        co_scoped_tours = co_fy_records["tours"]
+
         if "CoAdminAcknowledged" not in df_requests.columns:
             df_requests["CoAdminAcknowledged"] = ""
         if "SelectedCoAdmin" not in df_requests.columns:
             df_requests["SelectedCoAdmin"] = ""
-        if not df_requests.empty:
-            to_review = df_requests[
-                (df_requests["SelectedCoAdmin"].astype(str).str.strip() == str(st.session_state.user_name).strip()) &
-                (df_requests["CoAdminAcknowledged"].apply(is_unacknowledged)) &
-                (df_requests["Status"].astype(str).str.strip().isin(["Pending", "Approved"]))
+        if co_scoped_leaves is not None and not co_scoped_leaves.empty:
+            if "CoAdminAcknowledged" not in co_scoped_leaves.columns:
+                co_scoped_leaves["CoAdminAcknowledged"] = ""
+            if "SelectedCoAdmin" not in co_scoped_leaves.columns:
+                co_scoped_leaves["SelectedCoAdmin"] = ""
+            to_review = co_scoped_leaves[
+                (co_scoped_leaves["SelectedCoAdmin"].astype(str).str.strip() == str(st.session_state.user_name).strip()) &
+                (co_scoped_leaves["CoAdminAcknowledged"].apply(is_unacknowledged)) &
+                (co_scoped_leaves["Status"].astype(str).str.strip().isin(["Pending", "Approved"]))
             ]
 
             if to_review.empty:
                 st.info("No requests currently assigned to you for support.")
             else:
                 for idx, row in to_review.iterrows():
+                    is_co_lv_act = _is_active_sheet_row(row)
                     with st.expander(f"{row['Name']} requested {row['TotalDays']} days of {row['LeaveType']}"):
                         st.write(
                             f"**Dates:** {row['StartDate']} to {row['EndDate']}")
@@ -8188,15 +9374,14 @@ def coadmin_dashboard():
                         if "Other" in str(row['LeaveType']) or row.get("EffectsServiceYear") == "Yes":
                             st.warning(
                                 f"🚨 **ATTENTION:** This is an '{row['LeaveType']}' leave. The employee has checked 'EffectsServiceYear = {row.get('EffectsServiceYear')}'. Please double-check if this type of leave (e.g. Education Leave) should delay their service year before approving!")
-                        if st.button("Support Request", type="primary", key=f"ack_{row['ID']}"):
+                        if st.button("Support Request", type="primary", key=f"ack_{row['ID']}", disabled=not is_co_lv_act):
                             with st.spinner('Processing... Please wait and do not click again.'):
-                                df_requests.at[idx,
-                                                "CoAdminAcknowledged"] = "Supported"
-                                df_requests.at[idx,
-                                                "SupportedBy"] = st.session_state.user_name
-                                conn.update(worksheet="LeaveRequests",
-                                            data=df_requests)
-                                st.cache_data.clear()
+                                act_m = df_requests[df_requests["ID"].map(_normalize_record_id) == _normalize_record_id(row["ID"])].index
+                                if not act_m.empty:
+                                    df_requests.loc[act_m, "CoAdminAcknowledged"] = "Supported"
+                                    df_requests.loc[act_m, "SupportedBy"] = st.session_state.user_name
+                                    _gsheets_retry(conn.update, worksheet="LeaveRequests", data=df_requests)
+                                    _invalidate_sheet_cache("LeaveRequests")
                                 # 1. Notify Admins
                                 send_ntfy_notification(
                                     get_role_ntfy_topics("Admin"),
@@ -8217,8 +9402,8 @@ def coadmin_dashboard():
 
     with tab_tr_sup:
         st.subheader("Official Tours to Support", anchor="tours-to-support")
-        tours_df = load_tour_sanctions()
-        if tours_df is not None and not tours_df.empty:
+        tours_df = tours_df_co_raw
+        if co_scoped_tours is not None and not co_scoped_tours.empty:
             def _co_can_see_tour(row):
                 if str(row.get("SelectedCoAdmin", "")).strip() != str(st.session_state.user_name).strip():
                     return False
@@ -8235,12 +9420,12 @@ def coadmin_dashboard():
                     return False
                 return True
 
-            to_support_tours = tours_df[tours_df.apply(_co_can_see_tour, axis=1)]
+            to_support_tours = co_scoped_tours[co_scoped_tours.apply(_co_can_see_tour, axis=1)]
 
             # Mention branch tours waiting for Branch Manager approval
-            waiting_bm_tours = tours_df[
-                (tours_df["SelectedCoAdmin"].astype(str).str.strip() == str(st.session_state.user_name).strip()) &
-                (tours_df["Status"].astype(str).str.strip().isin(["Pending Branch Manager Support"]))
+            waiting_bm_tours = co_scoped_tours[
+                (co_scoped_tours["SelectedCoAdmin"].astype(str).str.strip() == str(st.session_state.user_name).strip()) &
+                (co_scoped_tours["Status"].astype(str).str.strip().isin(["Pending Branch Manager Support"]))
             ]
             if not waiting_bm_tours.empty:
                 cnt_bm_wait = len(waiting_bm_tours)
@@ -8251,6 +9436,7 @@ def coadmin_dashboard():
                     st.info("No tour applications awaiting your endorsement.")
             else:
                 for idx, tr in to_support_tours.iterrows():
+                    is_co_tr_act = _is_active_sheet_row(tr)
                     with st.expander(f"✈️ {tr['Name']} — Tour to {tr['Destination']} ({tr['TotalDays']} Day(s))", expanded=True):
                         st.write(f"**Travel Dates:** {tr['DepartureDate']} to {tr['ArrivalDate']}")
                         st.write(f"**Conveyance:** {tr.get('ConveyanceMode', 'Road')}")
@@ -8284,18 +9470,20 @@ def coadmin_dashboard():
                                 purp_display = purp_display[:-2]
                             st.write(f"**Work Description:** {purp_display}")
                         
-                        pdf_data = generate_tour_sanction_pdf(tr)
-                        if pdf_data:
-                            if st.button("📄 Preview Tour PDF", key=f"prev_tr_co_{tr['ID']}"):
+                        if st.button("📄 Preview Tour PDF", key=f"prev_tr_co_{tr['ID']}"):
+                            pdf_data = generate_tour_sanction_pdf(tr)
+                            if pdf_data:
                                 open_pdf_dialog(pdf_data, f"{tr['Name']}_Tour_Preview.pdf")
                                 
                         c_sup, c_rej = st.columns(2)
-                        if c_sup.button("🤝 Support", type="primary", key=f"sup_tr_btn_{tr['ID']}", use_container_width=True):
+                        if c_sup.button("🤝 Support", type="primary", key=f"sup_tr_btn_{tr['ID']}", use_container_width=True, disabled=not is_co_tr_act):
                             with st.spinner("Endorsing Tour Request..."):
-                                tours_df.at[idx, "SupportedBy"] = st.session_state.user_name
-                                tours_df.at[idx, "Status"] = "Pending Admin Sanction"
-                                conn.update(worksheet="TourSanctions", data=tours_df)
-                                st.cache_data.clear()
+                                act_tm = tours_df[tours_df["ID"].map(_normalize_record_id) == _normalize_record_id(tr["ID"])].index
+                                if not act_tm.empty:
+                                    tours_df.loc[act_tm, "SupportedBy"] = st.session_state.user_name
+                                    tours_df.loc[act_tm, "Status"] = "Pending Admin Sanction"
+                                    _gsheets_retry(conn.update, worksheet="TourSanctions", data=tours_df)
+                                    _invalidate_sheet_cache("TourSanctions")
                                 target_admin = tr.get("SelectedAdmin", "Admin")
                                 adm_top = get_user_ntfy_topic(target_admin) or get_role_ntfy_topics("Admin")
                                 send_ntfy_notification(
@@ -8313,12 +9501,14 @@ def coadmin_dashboard():
                                 st.success(f"Supported Tour request for {tr['Name']}! Forwarded to Admin ({target_admin}) for final sanction.")
                                 st.rerun()
                                 
-                        if c_rej.button("❌ Reject Tour", key=f"rej_tr_co_{tr['ID']}", use_container_width=True):
+                        if c_rej.button("❌ Reject Tour", key=f"rej_tr_co_{tr['ID']}", use_container_width=True, disabled=not is_co_tr_act):
                             with st.spinner("Rejecting Tour Request..."):
-                                tours_df.at[idx, "Status"] = "Rejected"
-                                tours_df.at[idx, "SupportedBy"] = f"Rejected by {st.session_state.user_name}"
-                                conn.update(worksheet="TourSanctions", data=tours_df)
-                                st.cache_data.clear()
+                                act_tm = tours_df[tours_df["ID"].map(_normalize_record_id) == _normalize_record_id(tr["ID"])].index
+                                if not act_tm.empty:
+                                    tours_df.loc[act_tm, "Status"] = "Rejected"
+                                    tours_df.loc[act_tm, "SupportedBy"] = f"Rejected by {st.session_state.user_name}"
+                                    _gsheets_retry(conn.update, worksheet="TourSanctions", data=tours_df)
+                                    _invalidate_sheet_cache("TourSanctions")
                                 emp_top = get_user_ntfy_topic(tr['Name'])
                                 if emp_top:
                                     send_ntfy_notification(
@@ -8333,7 +9523,11 @@ def coadmin_dashboard():
 
     with tab_cal:
         with st.expander("📅 Organizational Calendar", expanded=False):
-            render_organization_calendar()
+            render_organization_calendar(
+                fy_year_override=co_fy_yr,
+                leaves_override=co_scoped_leaves,
+                tours_override=co_scoped_tours,
+            )
 
         allowed_branches_co = get_active_visible_branches()
         branch_map_co = get_user_branch_map()
@@ -8341,8 +9535,8 @@ def coadmin_dashboard():
         st.subheader("Office Availability Overview")
         if allowed_branches_co:
             st.caption(f"🔎 Showing branches: **{format_branch_scope(allowed_branches_co)}**")
-        df_requests_co = load_leave_requests()
-        if not df_requests_co.empty:
+        df_requests_co = co_scoped_leaves
+        if df_requests_co is not None and not df_requests_co.empty:
             overview = filter_df_by_branches(
                 df_requests_co[df_requests_co["Status"].isin(["Pending", "Approved"])],
                 allowed_branches_co,
@@ -8350,8 +9544,6 @@ def coadmin_dashboard():
                 name_col="Name"
             )
             if not overview.empty:
-                overview = overview.iloc[::-1] # Show latest first
-                
                 if "page_coadmin" not in st.session_state:
                     st.session_state.page_coadmin = 0
                     
@@ -8370,8 +9562,8 @@ def coadmin_dashboard():
                     col1, col2 = st.columns([5, 1])
                     col1.write(f"**{row['Name']}** - {row['LeaveType']} ({row['StartDate']} to {row['EndDate']}) - {row['Status']}")
                     if row['Status'] == "Approved":
-                        pdf_bytes = generate_leave_pdf(row)
                         if col2.button("📄 Preview PDF", key=f"prev_co_{row['ID']}"):
+                            pdf_bytes = generate_leave_pdf(row)
                             open_pdf_dialog(pdf_bytes, f"{row['Name']}_{row['StartDate']}_Leave.pdf")
                 
                 st.divider()
@@ -8430,22 +9622,39 @@ def accounts_dashboard():
         render_system_settings(is_admin=False)
         
     with tab1:
+        df_requests = load_leave_requests()
+        tours_df_acct_raw = load_tour_sanctions()
+        acct_fy_sel = render_fy_scope_selector(
+            key="accounts_fy_scope",
+            label="📅 Select Financial Year (FY) Scope for Accounts Registers",
+            include_all=True,
+            leave_df=df_requests,
+            tour_df=tours_df_acct_raw,
+        )
+        acct_fy_yr = acct_fy_sel["fy_year"] if isinstance(acct_fy_sel, dict) else None
+        acct_fy_records = load_fy_records(acct_fy_yr, leave_df_active=df_requests, tour_df_active=tours_df_acct_raw)
+        acct_fy_leaves = acct_fy_records["leaves"]
+        acct_fy_tours = acct_fy_records["tours"]
+
         with st.expander("📅 View Organization Calendar", expanded=False):
-            render_organization_calendar()
+            render_organization_calendar(
+                fy_year_override=acct_fy_yr,
+                leaves_override=acct_fy_leaves,
+                tours_override=acct_fy_tours,
+            )
         with st.expander("📊 Master Balance Table", expanded=False):
             render_master_balance_table()
         st.divider()
         
-        df_requests = load_leave_requests()
         allowed_branches_acct = get_active_visible_branches()
         branch_map_acct = get_user_branch_map()
-        scoped_df_requests = filter_df_by_branches(df_requests, allowed_branches_acct, branch_map_acct, name_col="Name")
+        scoped_df_requests = filter_df_by_branches(acct_fy_leaves, allowed_branches_acct, branch_map_acct, name_col="Name")
         
         st.subheader("All Leaves Overview")
         if allowed_branches_acct:
             st.caption(f"🔎 Showing branches: **{format_branch_scope(allowed_branches_acct)}**")
         if scoped_df_requests is not None and not scoped_df_requests.empty:
-            all_leaves = scoped_df_requests.iloc[::-1] # Show latest first
+            all_leaves = scoped_df_requests
             
             if "page_accounts" not in st.session_state:
                 st.session_state.page_accounts = 0
@@ -8462,6 +9671,7 @@ def accounts_dashboard():
             current_page_df = all_leaves.iloc[start_idx:end_idx]
             
             for idx, row in current_page_df.iterrows():
+                    is_acct_row_act = _is_active_sheet_row(row)
                     col1, col2, col3, col4 = st.columns([4.5, 1, 1, 2])
 
                     raw_status = str(row.get('Status', '')).strip()
@@ -8481,20 +9691,24 @@ def accounts_dashboard():
 
                     col1.write(f"**{row['Name']}** - {row['LeaveType']} ({row['StartDate']} to {row['EndDate']}) - Status: {display_status}")
 
-                    pdf_bytes = generate_leave_pdf(row)
                     if col2.button(" Preview", key=f"prev_acc_all_{row['ID']}"):
+                        pdf_bytes = generate_leave_pdf(row)
                         open_pdf_dialog(pdf_bytes, f"{row['Name']}_{row['StartDate']}_Leave.pdf")
-                    col3.download_button(" PDF", data=pdf_bytes, file_name=f"{row['Name']}_{row['StartDate']}_Leave.pdf", mime="application/pdf", key=f"dl_acc_{row['ID']}")
+                    if col3.button(" PDF", key=f"prep_dl_acc_{row['ID']}"):
+                        pdf_bytes = generate_leave_pdf(row)
+                        col3.download_button(" ⬇️ Download", data=pdf_bytes, file_name=f"{row['Name']}_{row['StartDate']}_Leave.pdf", mime="application/pdf", key=f"dl_acc_{row['ID']}")
                     
                     is_punched = str(row.get('AccountsPunched', 'No')).strip().lower() in ['yes', 'punched']
                     if is_punched:
                         col4.success("✅ Punched")
                     elif raw_status == "Approved":
-                        if col4.button("Punch in Register", key=f"punch_acc_all_{row['ID']}", type="primary"):
-                            df_requests.at[idx, "AccountsPunched"] = "Punched"
-                            df_requests.at[idx, "PunchedBy"] = st.session_state.user_name
-                            conn.update(worksheet="LeaveRequests", data=df_requests)
-                            st.cache_data.clear()
+                        if col4.button("Punch in Register", key=f"punch_acc_all_{row['ID']}", type="primary", disabled=not is_acct_row_act):
+                            act_m = df_requests[df_requests["ID"].map(_normalize_record_id) == _normalize_record_id(row["ID"])].index
+                            if not act_m.empty:
+                                df_requests.loc[act_m, "AccountsPunched"] = "Punched"
+                                df_requests.loc[act_m, "PunchedBy"] = st.session_state.user_name
+                                _gsheets_retry(conn.update, worksheet="LeaveRequests", data=df_requests)
+                                _invalidate_sheet_cache("LeaveRequests")
                             send_ntfy_notification(
                                 get_role_ntfy_topics("Admin"),
                                 "Leave Punched in Register 📇",
@@ -8541,6 +9755,7 @@ def accounts_dashboard():
             else:
                 st.error(f"🔔 You have {len(action_required)} approved leave request(s) waiting to be punched in the register!")
                 for idx, row in action_required.iterrows():
+                    is_act_req_row = _is_active_sheet_row(row)
                     with st.expander(f"{row['Name']} took {row['TotalDays']} days of {row['LeaveType']}"):
                         st.write(f"**Dates:** {row['StartDate']} to {row['EndDate']}")
                         st.write(f"**Department:** {row.get('Department', '')}")
@@ -8556,17 +9771,19 @@ def accounts_dashboard():
                         else:
                             st.caption(f"**Admin:** {admin_status} &nbsp;|&nbsp; **Co-Admin:** {co_status}")
                         
-                        pdf_bytes = generate_leave_pdf(row)
                         col_btn1, col_btn2 = st.columns(2)
                         
                         if col_btn1.button("📄 Preview PDF", key=f"prev_act_{row['ID']}"):
+                            pdf_bytes = generate_leave_pdf(row)
                             open_pdf_dialog(pdf_bytes, f"{row['Name']}_{row['StartDate']}_Leave.pdf")
                             
-                        if col_btn2.button("Mark Punched in Register", type="primary", key=f"punch_{row['ID']}"):
-                            df_requests.at[idx, "AccountsPunched"] = "Punched"
-                            df_requests.at[idx, "PunchedBy"] = st.session_state.user_name
-                            conn.update(worksheet="LeaveRequests", data=df_requests)
-                            st.cache_data.clear()
+                        if col_btn2.button("Mark Punched in Register", type="primary", key=f"punch_{row['ID']}", disabled=not is_act_req_row):
+                            act_m = df_requests[df_requests["ID"].map(_normalize_record_id) == _normalize_record_id(row["ID"])].index
+                            if not act_m.empty:
+                                df_requests.loc[act_m, "AccountsPunched"] = "Punched"
+                                df_requests.loc[act_m, "PunchedBy"] = st.session_state.user_name
+                                _gsheets_retry(conn.update, worksheet="LeaveRequests", data=df_requests)
+                                _invalidate_sheet_cache("LeaveRequests")
                             send_ntfy_notification(
                                 get_role_ntfy_topics("Admin"),
                                 "Leave Punched in Register 📚",
@@ -8585,8 +9802,8 @@ def accounts_dashboard():
         st.subheader("Sanctioned Tours — Tour Register Entry", anchor="tour-register-accounts")
         if allowed_branches_acct:
             st.caption(f"🔎 Showing branches: **{format_branch_scope(allowed_branches_acct)}**")
-        tours_df = load_tour_sanctions()
-        scoped_tours_df = filter_df_by_branches(tours_df, allowed_branches_acct, branch_map_acct, name_col="Name")
+        tours_df = tours_df_acct_raw
+        scoped_tours_df = filter_df_by_branches(acct_fy_tours, allowed_branches_acct, branch_map_acct, name_col="Name")
         if scoped_tours_df is not None and not scoped_tours_df.empty:
             to_punch = scoped_tours_df[
                 (scoped_tours_df["Status"].isin(["Sanctioned", "Completed", "Settled"])) &
@@ -8597,18 +9814,21 @@ def accounts_dashboard():
             else:
                 st.warning(f"⚠️ {len(to_punch)} tour(s) awaiting Tour Register entry:")
                 for idx, r in to_punch.iterrows():
+                    is_acct_tr_act = _is_active_sheet_row(r)
                     c1, c2, c3 = st.columns([4, 1.5, 1.5])
                     c1.write(f"**{r['Name']}** — Tour to **{r['Destination']}** ({r['DepartureDate']} to {r['ArrivalDate']})")
-                    pdf_bytes = generate_tour_sanction_pdf(r)
-                    if pdf_bytes:
-                        if c2.button("📄 Preview", key=f"prev_tr_acc_{r['ID']}"):
+                    if c2.button("📄 Preview", key=f"prev_tr_acc_{r['ID']}"):
+                        pdf_bytes = generate_tour_sanction_pdf(r)
+                        if pdf_bytes:
                             open_pdf_dialog(pdf_bytes, f"{r['Name']}_Tour_{r['ID']}.pdf")
-                    if c3.button("Punch in Register", type="primary", key=f"punch_tr_acc_{r['ID']}"):
+                    if c3.button("Punch in Register", type="primary", key=f"punch_tr_acc_{r['ID']}", disabled=not is_acct_tr_act):
                         with st.spinner("Punching in register..."):
-                            tours_df.at[idx, "AccountsPunched"] = "Yes"
-                            tours_df.at[idx, "PunchedBy"] = st.session_state.user_name
-                            conn.update(worksheet="TourSanctions", data=tours_df)
-                            st.cache_data.clear()
+                            act_tm = tours_df[tours_df["ID"].map(_normalize_record_id) == _normalize_record_id(r["ID"])].index
+                            if not act_tm.empty:
+                                tours_df.loc[act_tm, "AccountsPunched"] = "Yes"
+                                tours_df.loc[act_tm, "PunchedBy"] = st.session_state.user_name
+                                _gsheets_retry(conn.update, worksheet="TourSanctions", data=tours_df)
+                                _invalidate_sheet_cache("TourSanctions")
                             send_ntfy_notification(
                                 get_role_ntfy_topics("Admin"),
                                 "Tour Punched in Register 📇",
@@ -8626,14 +9846,37 @@ def accounts_dashboard():
 
             st.divider()
             st.subheader("All Tour Records")
-            all_trs = scoped_tours_df.iloc[::-1]
-            for _, r in all_trs.iterrows():
+            all_trs = scoped_tours_df
+            if "page_accounts_tours" not in st.session_state:
+                st.session_state.page_accounts_tours = 0
+            acc_tr_per_page = 10
+            tot_acc_tr = len(all_trs)
+            tot_acc_tr_pages = max(1, (tot_acc_tr - 1) // acc_tr_per_page + 1)
+            if st.session_state.page_accounts_tours >= tot_acc_tr_pages:
+                st.session_state.page_accounts_tours = tot_acc_tr_pages - 1
+            at_s = st.session_state.page_accounts_tours * acc_tr_per_page
+            at_e = at_s + acc_tr_per_page
+            for _, r in all_trs.iloc[at_s:at_e].iterrows():
                 c1, c2 = st.columns([5, 1])
                 c1.write(f"**{r['Name']}** — Tour to **{r['Destination']}** ({r['DepartureDate']} to {r['ArrivalDate']}) — Status: {r['Status']} — Punched: {r.get('AccountsPunched', 'No')}")
-                pdf_bytes = generate_tour_sanction_pdf(r)
-                if pdf_bytes:
-                    if c2.button("📄 PDF", key=f"acc_all_tr_pdf_{r['ID']}"):
+                if c2.button("📄 PDF", key=f"acc_all_tr_pdf_{r['ID']}"):
+                    pdf_bytes = generate_tour_sanction_pdf(r)
+                    if pdf_bytes:
                         open_pdf_dialog(pdf_bytes, f"{r['Name']}_Tour_{r['ID']}.pdf")
+            if tot_acc_tr_pages > 1:
+                apt1, apt2, apt3 = st.columns([1, 2, 1])
+                with apt1:
+                    if st.session_state.page_accounts_tours > 0:
+                        if st.button("⬅️ Previous Tours", key="prev_acc_tr_btn"):
+                            st.session_state.page_accounts_tours -= 1
+                            st.rerun()
+                with apt2:
+                    st.markdown(f"<div style='text-align: center'>Tour Page {st.session_state.page_accounts_tours + 1} of {tot_acc_tr_pages}</div>", unsafe_allow_html=True)
+                with apt3:
+                    if st.session_state.page_accounts_tours < tot_acc_tr_pages - 1:
+                        if st.button("Next Tours ➡️", key="next_acc_tr_btn"):
+                            st.session_state.page_accounts_tours += 1
+                            st.rerun()
         else:
             st.info("No tour data available.")
 
@@ -8831,9 +10074,25 @@ def render_smart_notifications(role, user_name):
 # ==============================================================================
 
 _ARCHIVE_TITLE_RE = re.compile(
-    r"^(LeaveRequests|TourSanctions)_Archive_FY(\d{4})[-_/](\d{4})$",
+    r"^(LeaveRequests|TourSanctions)_Archive_FY(\d{4})[-_/](\d{2,4})$",
     re.IGNORECASE,
 )
+
+_CANONICAL_LEAVE_COLS = [
+    "ID", "Name", "LeaveType", "Reason", "EffectsServiceYear", "ApplicationDate",
+    "StartDate", "StartHalf", "EndDate", "EndHalf", "TotalDays", "Department",
+    "SelectedCoAdmin", "SelectedAdmin", "Status", "CoAdminAcknowledged",
+    "SupportedBy", "AccountsPunched", "PunchedBy", "ApprovedBy",
+    "CLBalance", "ALBalance", "SLBalance", "ULBalance",
+]
+
+_CANONICAL_TOUR_COLS = [
+    "ID", "Name", "Branch", "Role", "Post", "Purpose", "Destination",
+    "DepartureDate", "ArrivalDate", "TotalDays", "ConveyanceMode", "Status",
+    "SelectedCoAdmin", "SelectedAdmin", "BranchManager", "BMSupportedBy",
+    "SupportedBy", "ApprovedBy", "SanctionedBy", "AccountsPunched", "PunchedBy",
+    "ApplicationDate", "TravelLegs",
+]
 
 
 def _extract_fy_year_from_archive_title(title):
@@ -8841,17 +10100,59 @@ def _extract_fy_year_from_archive_title(title):
     m = _ARCHIVE_TITLE_RE.match(str(title or "").strip())
     if not m:
         return None, None
-    return m.group(1), int(m.group(2))
+    raw_kind = m.group(1).lower()
+    kind = "LeaveRequests" if raw_kind.startswith("leave") else "TourSanctions"
+    return kind, int(m.group(2))
+
+
+def _normalize_record_id(val):
+    """Normalizes record IDs so '101', '101.0', and 101 match identically while empty/null returns ''."""
+    if val is None:
+        return ""
+    try:
+        if pd.isnull(val):
+            return ""
+    except Exception:
+        pass
+    if isinstance(val, (int, float)):
+        if isinstance(val, float) and val.is_integer():
+            return str(int(val))
+        return str(val)
+    s = str(val).strip()
+    if not s or s.lower() in ("nan", "none", "null", "nat"):
+        return ""
+    if re.match(r"^-?\d+\.0+$", s):
+        return s.split(".", 1)[0]
+    return s
+
+
+def _is_active_sheet_row(row):
+    """Returns True when a record came from the live active worksheet (not a read-only archive)."""
+    if row is None or not hasattr(row, "get"):
+        return True
+    return str(row.get("_source_sheet", "active")).strip().lower() != "archive"
 
 
 @st.cache_data(ttl=120, show_spinner=False)
 def _list_spreadsheet_sheet_titles():
     """Fetches existing worksheet titles from Google Sheets for archive FY discovery."""
+    _retry_fn = globals().get("_gsheets_retry")
     try:
-        spread = conn.client._open_spreadsheet(spreadsheet=None, folder_id=None)
+        spread = _retry_fn(conn.client._open_spreadsheet, spreadsheet=None, folder_id=None) if callable(_retry_fn) else conn.client._open_spreadsheet(spreadsheet=None, folder_id=None)
         return [str(ws.title).strip() for ws in spread.worksheets()]
     except Exception:
         return []
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _read_cached_archive_sheet(sheet_name):
+    """Cached reader for immutable historical FY archive worksheets."""
+    _gs_read = globals().get("_gsheets_read")
+    try:
+        df = _gs_read(conn, sheet_name) if callable(_gs_read) else conn.read(worksheet=sheet_name)
+        return df.copy() if df is not None else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
 
 
 def _resolve_archive_titles(conn_override=None, archive_titles=None):
@@ -8859,8 +10160,9 @@ def _resolve_archive_titles(conn_override=None, archive_titles=None):
     if archive_titles is not None:
         return list(archive_titles)
     if conn_override is not None:
+        _retry_fn = globals().get("_gsheets_retry")
         try:
-            spread = conn_override.client._open_spreadsheet(spreadsheet=None, folder_id=None)
+            spread = _retry_fn(conn_override.client._open_spreadsheet, spreadsheet=None, folder_id=None) if callable(_retry_fn) else conn_override.client._open_spreadsheet(spreadsheet=None, folder_id=None)
             return [str(ws.title).strip() for ws in spread.worksheets()]
         except Exception:
             return []
@@ -8904,33 +10206,37 @@ def find_users_missing_from_staff_master(users_df, staff_df, active_fy=None):
 
 
 def _row_date_span_fy_years(df, start_col, end_col):
-    """Collects financial start years covered by [start_col, end_col] spans in a DataFrame."""
+    """Collects financial start years covered by [start_col, end_col] spans in a DataFrame (IST-safe)."""
     years = set()
     if df is None or df.empty or start_col not in df.columns:
         return years
-    s_series = pd.to_datetime(df[start_col], errors="coerce")
-    e_series = pd.to_datetime(df[end_col], errors="coerce") if end_col in df.columns else s_series
-    for sd_ts, ed_ts in zip(s_series, e_series):
-        if pd.isna(sd_ts) and pd.isna(ed_ts):
+    s_vals = df[start_col].tolist()
+    e_vals = df[end_col].tolist() if end_col in df.columns else s_vals
+    for raw_s, raw_e in zip(s_vals, e_vals):
+        sd = _parse_cta_date(raw_s)
+        ed = _parse_cta_date(raw_e)
+        if sd is None and ed is None:
             continue
-        s_d = sd_ts.date() if not pd.isna(sd_ts) else ed_ts.date()
-        e_d = ed_ts.date() if not pd.isna(ed_ts) else s_d
+        s_d = sd if sd is not None else ed
+        e_d = ed if ed is not None else s_d
         if e_d < s_d:
-            e_d = s_d
+            s_d, e_d = e_d, s_d
         sy = s_d.year if s_d.month >= 4 else s_d.year - 1
         ey = e_d.year if e_d.month >= 4 else e_d.year - 1
         for y in range(sy, min(ey, sy + 10) + 1):
-            if 2015 <= y <= 2100:
+            if 1990 <= y <= 2100:
                 years.add(y)
     return years
 
 
-def get_auditor_available_fys(
+def get_available_fys(
     conn_override=None,
     as_of_date=None,
     leave_df=None,
     tour_df=None,
     archive_titles=None,
+    df_req_active=None,
+    df_tour_active=None,
 ):
     """Discovers selectable Financial Years across Current FY, Archive worksheets, and active records."""
     cur_s, _, _ = get_current_financial_year_dates(as_of_date)
@@ -8942,22 +10248,24 @@ def get_auditor_available_fys(
     for t in (titles or []):
         kind, yr = _extract_fy_year_from_archive_title(t)
         if kind and yr is not None:
-            if kind.lower().startswith("leave"):
+            if kind == "LeaveRequests":
                 lr_archives[yr] = t
-            elif kind.lower().startswith("tour"):
+            elif kind == "TourSanctions":
                 tr_archives[yr] = t
 
-    active_leaves = leave_df if leave_df is not None else load_leave_requests()
-    active_tours = tour_df if tour_df is not None else load_tour_sanctions()
+    eff_l = leave_df if leave_df is not None else df_req_active
+    eff_t = tour_df if tour_df is not None else df_tour_active
+    active_leaves = eff_l if eff_l is not None else load_leave_requests()
+    active_tours = eff_t if eff_t is not None else load_tour_sanctions()
 
     discovered_yrs = {cur_fy_yr} | set(lr_archives.keys()) | set(tr_archives.keys())
     discovered_yrs |= {
         y for y in _row_date_span_fy_years(active_leaves, "StartDate", "EndDate")
-        if 2015 <= y <= cur_fy_yr + 2
+        if 1990 <= y <= cur_fy_yr + 5
     }
     discovered_yrs |= {
         y for y in _row_date_span_fy_years(active_tours, "DepartureDate", "ArrivalDate")
-        if 2015 <= y <= cur_fy_yr + 2
+        if 1990 <= y <= cur_fy_yr + 5
     }
 
     result = []
@@ -8973,48 +10281,87 @@ def get_auditor_available_fys(
     return result
 
 
-def _merge_and_dedupe_records(frames):
-    """Combines active and archived DataFrames cleanly, deduplicating by non-empty ID."""
+def get_auditor_available_fys(
+    conn_override=None,
+    as_of_date=None,
+    leave_df=None,
+    tour_df=None,
+    archive_titles=None,
+    df_req_active=None,
+    df_tour_active=None,
+):
+    """Compatible alias for get_available_fys."""
+    return get_available_fys(
+        conn_override=conn_override,
+        as_of_date=as_of_date,
+        leave_df=leave_df,
+        tour_df=tour_df,
+        archive_titles=archive_titles,
+        df_req_active=df_req_active,
+        df_tour_active=df_tour_active,
+    )
+
+
+def _merge_and_dedupe_records(frames, canonical_cols=None):
+    """Combines active and archived DataFrames cleanly, normalizing schema and deduplicating by normalized ID."""
     valid = [f.copy() for f in frames if f is not None and not f.empty]
     if not valid:
-        return pd.DataFrame()
+        cols = list(canonical_cols or [])
+        if "_source_sheet" not in cols:
+            cols.append("_source_sheet")
+        return pd.DataFrame(columns=cols)
     combined = pd.concat(valid, ignore_index=True)
+    if canonical_cols:
+        for col in canonical_cols:
+            if col not in combined.columns:
+                combined[col] = ""
+    if "_source_sheet" not in combined.columns:
+        combined["_source_sheet"] = "active"
+    else:
+        combined["_source_sheet"] = combined["_source_sheet"].fillna("active").replace("", "active")
+
     if "ID" in combined.columns:
-        id_str = combined["ID"].fillna("").astype(str).str.strip()
-        has_id = ~id_str.isin(["", "nan", "none", "None"])
-        with_id = combined[has_id].copy()
-        with_id["_dedupe_id"] = id_str[has_id]
+        norm_ids = [
+            _normalize_record_id(v)
+            for v in combined["ID"].tolist()
+        ]
+        combined["_dedupe_id"] = norm_ids
+        has_id_mask = pd.Series([bool(x) for x in norm_ids], index=combined.index)
+        with_id = combined[has_id_mask].copy()
+        with_id["ID"] = with_id["_dedupe_id"]
         with_id = with_id.drop_duplicates(subset=["_dedupe_id"], keep="first").drop(columns=["_dedupe_id"])
-        without_id = combined[~has_id].drop_duplicates()
+        without_id = combined[~has_id_mask].drop(columns=["_dedupe_id"])
         out = pd.concat([with_id, without_id], ignore_index=True)
-        return out
+        return out.reset_index(drop=True)
     return combined.drop_duplicates().reset_index(drop=True)
 
 
 def _filter_df_overlapping_fy(df, fy_yr, start_col, end_col):
-    """Filters rows whose [start_col, end_col] overlaps CTA Financial Year [Apr 1 fy_yr .. Mar 31 fy_yr+1]."""
+    """Filters rows whose [start_col, end_col] overlaps CTA Financial Year [Apr 1 fy_yr .. Mar 31 fy_yr+1] (IST-safe)."""
     if df is None or df.empty or fy_yr is None:
+        if df is not None and "_from_target_archive" in df.columns:
+            return df.drop(columns=["_from_target_archive"]).reset_index(drop=True)
         return df if df is not None else pd.DataFrame()
     if start_col not in df.columns:
         return df
     fy_start = date(int(fy_yr), 4, 1)
     fy_end = date(int(fy_yr) + 1, 3, 31)
-    s_parsed = pd.to_datetime(df[start_col], errors="coerce")
-    e_parsed = pd.to_datetime(df[end_col], errors="coerce") if end_col in df.columns else s_parsed
+    s_raw = df[start_col].tolist()
+    e_raw = df[end_col].tolist() if end_col in df.columns else s_raw
 
     keep_mask = []
     has_src_flag = "_from_target_archive" in df.columns
+    src_flags = df["_from_target_archive"].tolist() if has_src_flag else [False] * len(df)
     for idx in range(len(df)):
-        sd = s_parsed.iloc[idx]
-        ed = e_parsed.iloc[idx]
-        if pd.isna(sd) and pd.isna(ed):
-            # Preserve unparseable rows only if they came directly from that FY's dedicated archive
-            keep_mask.append(bool(has_src_flag and df["_from_target_archive"].iloc[idx]))
+        sd = _parse_cta_date(s_raw[idx])
+        ed = _parse_cta_date(e_raw[idx])
+        if sd is None and ed is None:
+            keep_mask.append(bool(src_flags[idx]))
             continue
-        s_d = sd.date() if not pd.isna(sd) else ed.date()
-        e_d = ed.date() if not pd.isna(ed) else s_d
+        s_d = sd if sd is not None else ed
+        e_d = ed if ed is not None else s_d
         if e_d < s_d:
-            e_d = s_d
+            s_d, e_d = e_d, s_d
         keep_mask.append(e_d >= fy_start and s_d <= fy_end)
 
     filtered = df[keep_mask].copy()
@@ -9023,17 +10370,51 @@ def _filter_df_overlapping_fy(df, fy_yr, start_col, end_col):
     return filtered.reset_index(drop=True)
 
 
-def load_auditor_fy_records(
-    selected_fy_yr,
+def _sort_records_desc(df, primary_date_col, secondary_date_col=None):
+    """Sorts records chronologically descending by primary_date_col (IST-safe)."""
+    if df is None or df.empty or primary_date_col not in df.columns:
+        return df if df is not None else pd.DataFrame()
+    out = df.copy()
+    p_dates = [_parse_cta_date(v) or date.min for v in out[primary_date_col].tolist()]
+    if secondary_date_col and secondary_date_col in out.columns:
+        s_dates = [_parse_cta_date(v) or date.min for v in out[secondary_date_col].tolist()]
+    else:
+        s_dates = p_dates
+    out["_sort_p"] = p_dates
+    out["_sort_s"] = s_dates
+    out["_sort_idx"] = list(range(len(out)))
+    out = out.sort_values(
+        by=["_sort_p", "_sort_s", "_sort_idx"],
+        ascending=[False, False, False],
+        kind="mergesort",
+    ).drop(columns=["_sort_p", "_sort_s", "_sort_idx"]).reset_index(drop=True)
+    return out
+
+
+def load_fy_records(
+    selected_fy_yr=None,
     conn_override=None,
     leave_df_active=None,
     tour_df_active=None,
     archive_titles=None,
+    df_req_active=None,
+    df_tour_active=None,
 ):
-    """Read-only loader merging active records and FY archives for any selected FY (or None for All FYs)."""
+    """Shared cached loader merging active records and FY archives for any selected FY (or None for All FYs)."""
     active_conn = conn_override if conn_override is not None else conn
-    df_l_active = leave_df_active.copy() if leave_df_active is not None else load_leave_requests()
-    df_t_active = tour_df_active.copy() if tour_df_active is not None else load_tour_sanctions()
+    eff_l = leave_df_active if leave_df_active is not None else df_req_active
+    eff_t = tour_df_active if tour_df_active is not None else df_tour_active
+    df_l_active = eff_l.copy() if eff_l is not None else load_leave_requests()
+    df_t_active = eff_t.copy() if eff_t is not None else load_tour_sanctions()
+
+    if df_l_active is not None and not df_l_active.empty:
+        df_l_active = df_l_active.copy()
+        df_l_active["_source_sheet"] = "active"
+        df_l_active["_from_target_archive"] = False
+    if df_t_active is not None and not df_t_active.empty:
+        df_t_active = df_t_active.copy()
+        df_t_active["_source_sheet"] = "active"
+        df_t_active["_from_target_archive"] = False
 
     titles = _resolve_archive_titles(conn_override=conn_override, archive_titles=archive_titles)
     lr_archives = {}
@@ -9041,9 +10422,9 @@ def load_auditor_fy_records(
     for t in (titles or []):
         kind, yr = _extract_fy_year_from_archive_title(t)
         if kind and yr is not None:
-            if kind.lower().startswith("leave"):
+            if kind == "LeaveRequests":
                 lr_archives[yr] = t
-            elif kind.lower().startswith("tour"):
+            elif kind == "TourSanctions":
                 tr_archives[yr] = t
 
     l_frames = [df_l_active] if df_l_active is not None and not df_l_active.empty else []
@@ -9053,11 +10434,15 @@ def load_auditor_fy_records(
 
     def _safe_read_arch(sheet_name, mark_target=False):
         try:
-            arch_df = active_conn.read(worksheet=sheet_name)
+            if conn_override is None:
+                arch_df = _read_cached_archive_sheet(sheet_name)
+            else:
+                _gs_read = globals().get("_gsheets_read")
+                arch_df = _gs_read(active_conn, sheet_name) if callable(_gs_read) else active_conn.read(worksheet=sheet_name)
             if arch_df is not None and not arch_df.empty:
                 arch_df = arch_df.copy()
-                if mark_target:
-                    arch_df["_from_target_archive"] = True
+                arch_df["_source_sheet"] = "archive"
+                arch_df["_from_target_archive"] = bool(mark_target)
                 return arch_df
         except Exception:
             return None
@@ -9076,33 +10461,99 @@ def load_auditor_fy_records(
                 t_frames.append(arch_df)
                 from_tr_arch = True
 
-        merged_l = _merge_and_dedupe_records(l_frames)
-        merged_t = _merge_and_dedupe_records(t_frames)
+        merged_l = _merge_and_dedupe_records(l_frames, canonical_cols=_CANONICAL_LEAVE_COLS)
+        merged_t = _merge_and_dedupe_records(t_frames, canonical_cols=_CANONICAL_TOUR_COLS)
+        filt_l = _filter_df_overlapping_fy(merged_l, fy_int, "StartDate", "EndDate")
+        filt_t = _filter_df_overlapping_fy(merged_t, fy_int, "DepartureDate", "ArrivalDate")
         return {
-            "leaves": _filter_df_overlapping_fy(merged_l, fy_int, "StartDate", "EndDate"),
-            "tours": _filter_df_overlapping_fy(merged_t, fy_int, "DepartureDate", "ArrivalDate"),
+            "leaves": _sort_records_desc(filt_l, "StartDate", "EndDate"),
+            "tours": _sort_records_desc(filt_t, "DepartureDate", "ArrivalDate"),
             "from_leave_archive": from_lr_arch,
             "from_tour_archive": from_tr_arch,
         }
 
     # selected_fy_yr is None -> Combine Active + All Archive Worksheets
     for yr in sorted(lr_archives.keys(), reverse=True):
-        arch_df = _safe_read_arch(lr_archives[yr])
+        arch_df = _safe_read_arch(lr_archives[yr], mark_target=False)
         if arch_df is not None:
             l_frames.append(arch_df)
             from_lr_arch = True
     for yr in sorted(tr_archives.keys(), reverse=True):
-        arch_df = _safe_read_arch(tr_archives[yr])
+        arch_df = _safe_read_arch(tr_archives[yr], mark_target=False)
         if arch_df is not None:
             t_frames.append(arch_df)
             from_tr_arch = True
 
+    merged_l_all = _merge_and_dedupe_records(l_frames, canonical_cols=_CANONICAL_LEAVE_COLS)
+    merged_t_all = _merge_and_dedupe_records(t_frames, canonical_cols=_CANONICAL_TOUR_COLS)
+    if "_from_target_archive" in merged_l_all.columns:
+        merged_l_all = merged_l_all.drop(columns=["_from_target_archive"])
+    if "_from_target_archive" in merged_t_all.columns:
+        merged_t_all = merged_t_all.drop(columns=["_from_target_archive"])
     return {
-        "leaves": _merge_and_dedupe_records(l_frames),
-        "tours": _merge_and_dedupe_records(t_frames),
+        "leaves": _sort_records_desc(merged_l_all, "StartDate", "EndDate"),
+        "tours": _sort_records_desc(merged_t_all, "DepartureDate", "ArrivalDate"),
         "from_leave_archive": from_lr_arch,
         "from_tour_archive": from_tr_arch,
     }
+
+
+def load_auditor_fy_records(
+    selected_fy_yr=None,
+    conn_override=None,
+    leave_df_active=None,
+    tour_df_active=None,
+    archive_titles=None,
+    df_req_active=None,
+    df_tour_active=None,
+):
+    """Compatible alias for load_fy_records."""
+    return load_fy_records(
+        selected_fy_yr=selected_fy_yr,
+        conn_override=conn_override,
+        leave_df_active=leave_df_active,
+        tour_df_active=tour_df_active,
+        archive_titles=archive_titles,
+        df_req_active=df_req_active,
+        df_tour_active=df_tour_active,
+    )
+
+
+def render_fy_scope_selector(
+    key,
+    label="📅 Select Financial Year (FY) Scope (April 1 – March 31)",
+    include_all=True,
+    as_of_date=None,
+    leave_df=None,
+    tour_df=None,
+):
+    """Renders a standardized Financial Year selector (defaulting to Current FY) across dashboards."""
+    avail_fys = get_available_fys(as_of_date=as_of_date, leave_df=leave_df, tour_df=tour_df)
+    fy_options = []
+    for item in avail_fys:
+        tag_parts = []
+        if item["is_current"]:
+            tag_parts.append("Current")
+        if item["leave_archive_sheet"] or item["tour_archive_sheet"]:
+            tag_parts.append("Archive")
+        tag_str = f" ({', '.join(tag_parts)})" if tag_parts else ""
+        fy_options.append({
+            "fy_year": item["fy_year"],
+            "label": f"{item['fy_label']}{tag_str}",
+            "info": item,
+        })
+    if include_all:
+        fy_options.append({"fy_year": None, "label": "All Available FYs", "info": None})
+    selected = st.selectbox(
+        label,
+        fy_options,
+        index=0,
+        format_func=lambda x: x["label"] if isinstance(x, dict) else str(x),
+        key=key,
+    )
+    if isinstance(selected, dict):
+        return selected
+    return fy_options[0] if fy_options else {"fy_year": get_current_financial_year_dates()[0].year, "label": "Current FY", "info": None}
 
 
 def build_auditor_demo_defaults(reference_date=None):
@@ -9338,8 +10789,22 @@ def auditor_dashboard():
     approved_days = 0.0
     if fy_leaves_raw is not None and not fy_leaves_raw.empty and "Status" in fy_leaves_raw.columns:
         app_l = fy_leaves_raw[fy_leaves_raw["Status"].astype(str).str.strip() == "Approved"]
-        if not app_l.empty and "TotalDays" in app_l.columns:
-            approved_days = float(pd.to_numeric(app_l["TotalDays"], errors="coerce").fillna(0.0).sum())
+        if not app_l.empty:
+            for _, ar_row in app_l.iterrows():
+                _, is_rev_l, abs_d = _parse_leave_type_info(ar_row.get("LeaveType", ""), ar_row.get("TotalDays", 0.0))
+                signed_d = -abs_d if is_rev_l else abs_d
+                if selected_fy_yr is not None:
+                    bdown_a = get_leave_fy_breakdown(
+                        _parse_cta_date(ar_row.get("StartDate")) or ar_row.get("StartDate"),
+                        _parse_cta_date(ar_row.get("EndDate")) or ar_row.get("EndDate"),
+                        signed_d,
+                    )
+                    if bdown_a and int(selected_fy_yr) in bdown_a:
+                        approved_days += float(bdown_a[int(selected_fy_yr)]["days"])
+                    elif not bdown_a:
+                        approved_days += signed_d
+                else:
+                    approved_days += signed_d
     n_tours = len(fy_tours_raw) if fy_tours_raw is not None else 0
 
     m1, m2, m3, m4 = st.columns(4)
@@ -9460,9 +10925,9 @@ def auditor_dashboard():
                 key="aud_leave_pdf_pick",
             )
             chosen_l_row = disp_l.iloc[sel_l_idx]
-            l_pdf_bytes = generate_leave_pdf(chosen_l_row)
-            if l_pdf_bytes:
-                if c_lp2.button("📄 Preview PDF", key="aud_btn_prev_lpdf", use_container_width=True):
+            if c_lp2.button("📄 Preview PDF", key="aud_btn_prev_lpdf", use_container_width=True):
+                l_pdf_bytes = generate_leave_pdf(chosen_l_row)
+                if l_pdf_bytes:
                     open_pdf_dialog(l_pdf_bytes, f"{chosen_l_row.get('Name', 'Leave')}_{chosen_l_row.get('ID', '')}.pdf")
         else:
             st.info("No leave records match the selected FY, branch, and filter criteria.")
@@ -9485,8 +10950,9 @@ def auditor_dashboard():
             pref_t_cols = [
                 c for c in [
                     "ID", "Name", "Branch", "Destination", "DepartureDate", "ArrivalDate",
-                    "TravelMode", "AdvanceRequested", "Status", "BranchManagerSupportedBy",
-                    "SupportedBy", "SanctionedBy", "AccountsPunched", "Purpose",
+                    "TotalDays", "ConveyanceMode", "TravelMode", "AdvanceRequested", "Status",
+                    "BMSupportedBy", "BranchManagerSupportedBy",
+                    "SupportedBy", "ApprovedBy", "SanctionedBy", "AccountsPunched", "Purpose",
                 ]
                 if c in disp_t.columns
             ]
@@ -9504,9 +10970,9 @@ def auditor_dashboard():
                 key="aud_tour_pdf_pick",
             )
             chosen_t_row = disp_t.iloc[sel_t_idx]
-            t_pdf_bytes = generate_tour_sanction_pdf(chosen_t_row)
-            if t_pdf_bytes:
-                if c_tp2.button("📄 Preview PDF", key="aud_btn_prev_tpdf", use_container_width=True):
+            if c_tp2.button("📄 Preview PDF", key="aud_btn_prev_tpdf", use_container_width=True):
+                t_pdf_bytes = generate_tour_sanction_pdf(chosen_t_row)
+                if t_pdf_bytes:
                     open_pdf_dialog(t_pdf_bytes, f"{chosen_t_row.get('Name', 'Tour')}_{chosen_t_row.get('ID', '')}.pdf")
         else:
             st.info("No tour sanction records match the selected FY, branch, and filter criteria.")
@@ -9612,7 +11078,11 @@ def auditor_dashboard():
                 )
                 disp_audit = disp_audit[a_mask]
             if "Timestamp" in disp_audit.columns:
-                disp_audit = disp_audit.iloc[::-1]
+                disp_audit = disp_audit.sort_values(
+                    by="Timestamp",
+                    ascending=False,
+                    kind="mergesort",
+                ).reset_index(drop=True)
             st.dataframe(disp_audit, use_container_width=True, hide_index=True)
         else:
             st.info("No entries recorded in `AuditLog` yet.")
@@ -9779,9 +11249,9 @@ def auditor_dashboard():
             "SLBalance": demo_raw_bals["SL"],
             "ULBalance": demo_raw_bals["UL"],
         }
-        demo_l_pdf = generate_leave_pdf(preview_demo_l_row)
-        if demo_l_pdf:
-            if btn_dl2.button("📄 Generate Demo Tibetan Leave PDF", key="aud_demo_prev_lpdf", use_container_width=True):
+        if btn_dl2.button("📄 Generate Demo Tibetan Leave PDF", key="aud_demo_prev_lpdf", use_container_width=True):
+            demo_l_pdf = generate_leave_pdf(preview_demo_l_row)
+            if demo_l_pdf:
                 open_pdf_dialog(demo_l_pdf, f"DEMO_{demo_emp_name}_Leave.pdf")
 
         # --- PART B: DEMO APPROVAL, REVERSAL & MARCH 31 FY ROLLOVER SIMULATOR ---
@@ -9973,9 +11443,10 @@ def auditor_dashboard():
                 else:
                     tc_step.caption("Workflow Complete ✅")
 
-                tr_pdf = generate_tour_sanction_pdf(dict(tr))
-                if tr_pdf and tc_pdf.button("📄 PDF", key=f"aud_demo_t_pdf_{t_i}", use_container_width=True):
-                    open_pdf_dialog(tr_pdf, f"DEMO_{tr['Name']}_{tr['ID']}.pdf")
+                if tc_pdf.button("📄 PDF", key=f"aud_demo_t_pdf_{t_i}", use_container_width=True):
+                    tr_pdf = generate_tour_sanction_pdf(dict(tr))
+                    if tr_pdf:
+                        open_pdf_dialog(tr_pdf, f"DEMO_{tr['Name']}_{tr['ID']}.pdf")
 
     # ------------------------------------------------------------------
     # TAB 5: COMPLETE SYSTEM GUIDE & POLICY MANUAL
@@ -10100,9 +11571,9 @@ def main_dashboard():
         if missing_users:
             new_df = pd.DataFrame(missing_users)
             staff_df = pd.concat([staff_df, new_df], ignore_index=True)
-            conn.update(worksheet="Staff_Master",
-                        data=inject_balance_formulas(staff_df))
-            st.cache_data.clear()
+            _gsheets_retry(conn.update, worksheet="Staff_Master",
+                           data=inject_balance_formulas(staff_df))
+            _invalidate_sheet_cache("Staff_Master")
             st.rerun()
 
     # Pre-load custom LeaveRules from Google Sheets on cold start before rollover & balance calculations
@@ -10183,7 +11654,7 @@ def main_dashboard():
             )
     
     if st.sidebar.button("🔄 Refresh Data", type="primary"):
-        st.cache_data.clear()
+        _invalidate_all_data_caches()
         st.rerun()
 
     with st.sidebar.expander("🔑 Change PIN"):
@@ -10205,8 +11676,8 @@ def main_dashboard():
                                         st.session_state.user_name].index
                     if not user_idx.empty:
                         users_df.at[user_idx[0], "PIN"] = clean_new_pin
-                        conn.update(worksheet="Users", data=users_df)
-                        st.cache_data.clear()
+                        _gsheets_retry(conn.update, worksheet="Users", data=users_df)
+                        _invalidate_sheet_cache("Users")
                         st.success("PIN updated successfully!")
 
     st.sidebar.divider()
@@ -10234,7 +11705,7 @@ def main_dashboard():
             st.session_state.user_email = None
             if "perimeter_verified_email" in st.session_state:
                 del st.session_state["perimeter_verified_email"]
-            st.cache_data.clear()
+            _invalidate_all_data_caches()
             if is_google_oauth_configured():
                 st.logout()
             else:
@@ -10263,34 +11734,39 @@ def main_dashboard():
 
 # --- MAIN APP FLOW ---
 
-if not st.session_state.logged_in:
-    # Attempt auto-login via cookie
-    auth_token = cookie_manager.get("auth_token")
-    if auth_token and '|' in str(auth_token):
-        saved_user, saved_pin = str(auth_token).split('|', 1)
-        users_df = load_users_data()
-        if users_df is not None and not users_df.empty:
-            user_row = users_df[users_df["Name"] == saved_user]
-            if not user_row.empty:
-                stored_pin = str(user_row.iloc[0]["PIN"]).split('.')[0].zfill(4)
-                if str(saved_pin) == stored_pin:
-                    # Verify perimeter match if OAuth is active
-                    saved_email = str(user_row.iloc[0].get("Email", "")).strip().lower()
-                    if is_google_oauth_configured():
-                        if getattr(st.user, "is_logged_in", False) and str(st.user.email).strip().lower() == saved_email:
+def run_app():
+    if not st.session_state.logged_in:
+        # Attempt auto-login via cookie
+        auth_token = cookie_manager.get("auth_token")
+        if auth_token and '|' in str(auth_token):
+            saved_user, saved_pin = str(auth_token).split('|', 1)
+            users_df = load_users_data()
+            if users_df is not None and not users_df.empty:
+                user_row = users_df[users_df["Name"] == saved_user]
+                if not user_row.empty:
+                    stored_pin = str(user_row.iloc[0]["PIN"]).split('.')[0].zfill(4)
+                    if str(saved_pin) == stored_pin:
+                        # Verify perimeter match if OAuth is active
+                        saved_email = str(user_row.iloc[0].get("Email", "")).strip().lower()
+                        if is_google_oauth_configured():
+                            if getattr(st.user, "is_logged_in", False) and str(st.user.email).strip().lower() == saved_email:
+                                st.session_state.logged_in = True
+                                st.session_state.user_name = saved_user
+                                st.session_state.user_role = str(user_row.iloc[0]["Role"]).strip()
+                                st.session_state.user_email = saved_email
+                                st.rerun()
+                        else:
                             st.session_state.logged_in = True
                             st.session_state.user_name = saved_user
                             st.session_state.user_role = str(user_row.iloc[0]["Role"]).strip()
                             st.session_state.user_email = saved_email
                             st.rerun()
-                    else:
-                        st.session_state.logged_in = True
-                        st.session_state.user_name = saved_user
-                        st.session_state.user_role = str(user_row.iloc[0]["Role"]).strip()
-                        st.session_state.user_email = saved_email
-                        st.rerun()
 
-if not st.session_state.logged_in:
-    login_screen()
-else:
-    main_dashboard()
+    if not st.session_state.logged_in:
+        login_screen()
+    else:
+        main_dashboard()
+
+
+if __name__ == "__main__":
+    run_app()
