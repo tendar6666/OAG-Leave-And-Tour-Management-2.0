@@ -61,7 +61,7 @@ ENABLE_NTFY = True  # Targeted user-specific notifications active
 # --- DEVELOPMENT MODE CONFIGURATION ---
 # Set to True during development for easy 1-click login and instant user switching.
 # Set to False (or remove) before final production deployment.
-DEV_MODE = False
+DEV_MODE = True
 
 def get_user_ntfy_topic(user_name):
     """Retrieves the unique personal NTFY topic for a specific user from Users worksheet."""
@@ -4449,18 +4449,22 @@ def build_dev_quick_role_shortcuts(users_df):
         raw_rl = "" if pd.isna(row.get("Role")) else str(row.get("Role")).strip()
         rl = raw_rl or "Employee"
         key = (br, rl)
+        br_label = _DEV_BRANCH_SHORT_LABELS.get(br, br)
+        rl_label = _DEV_ROLE_SHORT_LABELS.get(rl, rl)
+        raw_nm = "" if pd.isna(row.get("Name")) else str(row.get("Name")).strip()
+        raw_em = "" if pd.isna(row.get("Email")) else str(row.get("Email")).strip()
         if key not in seen:
-            br_label = _DEV_BRANCH_SHORT_LABELS.get(br, br)
-            rl_label = _DEV_ROLE_SHORT_LABELS.get(rl, rl)
-            raw_nm = "" if pd.isna(row.get("Name")) else str(row.get("Name")).strip()
-            raw_em = "" if pd.isna(row.get("Email")) else str(row.get("Email")).strip()
             seen[key] = (f"{br_label} {rl_label}", br, rl, raw_nm, raw_em)
+        elif br in ("SB", "NB", "DB") and rl == "Employee" and (br, "Employee#2") not in seen:
+            seen[(br, "Employee#2")] = (f"{br_label} {rl_label} 2", br, rl, raw_nm, raw_em)
 
     def _sort_key(item):
-        br, rl = item[0]
+        br, rl_key = item[0]
+        base_rl = rl_key.split("#")[0]
+        sub_idx = 1 if "#2" in rl_key else 0
         b_idx = _DEV_BRANCH_ORDER.index(br) if br in _DEV_BRANCH_ORDER else len(_DEV_BRANCH_ORDER)
-        r_idx = _DEV_ROLE_ORDER.index(rl) if rl in _DEV_ROLE_ORDER else len(_DEV_ROLE_ORDER)
-        return (b_idx, br, r_idx, rl)
+        r_idx = _DEV_ROLE_ORDER.index(base_rl) if base_rl in _DEV_ROLE_ORDER else len(_DEV_ROLE_ORDER)
+        return (b_idx, br, r_idx, sub_idx, rl_key)
 
     return [entry for _, entry in sorted(seen.items(), key=_sort_key)]
 
@@ -4493,11 +4497,12 @@ def render_dev_quick_role_buttons(users_df, key_prefix, group_by_branch=True, co
     for batch in batches:
         cols = st.columns(cols_per_row)
         for col_idx, (label, br, rl, u_name, u_email) in enumerate(batch):
+            btn_key_suffix = f"{br}_{rl}_2" if str(label).endswith(" 2") else f"{br}_{rl}"
             with cols[col_idx]:
                 if st.button(
                     label,
                     use_container_width=True,
-                    key=f"{key_prefix}_{br}_{rl}",
+                    key=f"{key_prefix}_{btn_key_suffix}",
                     help=f"Login as {u_name} ({br} • {rl})",
                 ):
                     st.session_state.logged_in = True
