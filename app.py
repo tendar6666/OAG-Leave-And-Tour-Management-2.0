@@ -3778,16 +3778,7 @@ def generate_leave_pdf(row):
         pdf.cell(
             0, 10, f"ཅ། གཞན། {to_tibetan_numeral(reason_val)}", new_x="LMARGIN", new_y="NEXT")
 
-        app_date = str(row.get('ApplicationDate', ''))
-        if app_date and app_date != "nan":
-            pdf.write(10, "༧། སྙན་ཞུ་ཕུལ་བའི་ཚེས། ")
-            start_x = pdf.get_x()
-            start_y = pdf.get_y()
-            pdf.write(10, f"{to_tibetan_numeral(format_tibetan_date(app_date))}")
-            if pdf.get_x() > start_x:
-                pdf.line(start_x, start_y + 8, pdf.get_x(), start_y + 8)
-            pdf.ln(10)
-
+        # ApplicationDate is stored as the submission timestamp in LeaveRequests (hidden on the printed Leave PDF)
         pdf.ln(10)
 
         y = pdf.get_y()
@@ -3830,7 +3821,16 @@ def generate_leave_pdf(row):
 
         pdf.ln(15)
         pdf.set_font("Monlam", "", 10)
-        pdf.cell(0, 10, "༼འདི་ནི་གྲངས་འཛིན་མཚན་རྟགས་བཀོད་པའི་ཡིག་ཆ་ཞིག་ཡིན་པས། དངོས་སུ་མཚན་རྟགས་རྒྱག་དགོས་མེད།༽", align="C")
+        pdf.cell(
+            0, 7,
+            "༼འདི་ནི་གྲངས་འཛིན་མཚན་རྟགས་བཀོད་པའི་ཡིག་ཆ་ཞིག་ཡིན་པས། དངོས་སུ་མཚན་རྟགས་རྒྱག་དགོས་མེད།༽",
+            new_x="LMARGIN", new_y="NEXT", align="C",
+        )
+        pdf.cell(
+            0, 7,
+            "སྔ་ལོའི་ཐོབ་གསེང་ཡོད་ཚེ་སྔ་ལོ་ནས་ཞུ་རྒྱུ་དང་། དེ་མིན་འདི་ལོ་ནས་ཞུ་རྒྱུ།",
+            new_x="LMARGIN", new_y="NEXT", align="C",
+        )
 
         return bytes(pdf.output())
     except Exception as e:
@@ -4956,7 +4956,8 @@ def employee_dashboard(hide_title=False):
                     key="leave_apply_admin"
                 )
 
-        application_date = st.date_input("Application Date", get_cta_today())
+        # ApplicationDate is captured automatically as submitted date & time in IST (hidden from applicant form)
+        submitted_app_dt_str = get_cta_now().strftime("%Y-%m-%d %H:%M:%S")
 
         col_start, col_end = st.columns(2)
         start_date = col_start.date_input("Start Date")
@@ -5064,7 +5065,7 @@ def employee_dashboard(hide_title=False):
             "LeaveType": f"Return-{leave_type}" if is_reversal else leave_type,
             "Reason": reason,
             "EffectsServiceYear": effects_service_year,
-            "ApplicationDate": application_date.strftime("%Y-%m-%d"),
+            "ApplicationDate": submitted_app_dt_str,
             "StartDate": start_date.strftime("%Y-%m-%d"),
             "StartHalf": start_half,
             "EndDate": end_date.strftime("%Y-%m-%d"),
@@ -5149,13 +5150,14 @@ def employee_dashboard(hide_title=False):
                             )
                         else:
                             req_id = st.session_state.get("_submit_request_id") or _make_submission_token(leave_submit_kind)
+                            exact_submit_dt = get_cta_now().strftime("%Y-%m-%d %H:%M:%S")
                             new_request = pd.DataFrame([{
                                 "ID": req_id,
                                 "Name": st.session_state.user_name,
                                 "LeaveType": f"Return-{leave_type}" if is_reversal else leave_type,
                                 "Reason": reason,
                                 "EffectsServiceYear": effects_service_year,
-                                "ApplicationDate": application_date.strftime("%Y-%m-%d"),
+                                "ApplicationDate": exact_submit_dt,
                                 "StartDate": start_date.strftime("%Y-%m-%d"),
                                 "StartHalf": start_half,
                                 "EndDate": end_date.strftime("%Y-%m-%d"),
@@ -8573,7 +8575,7 @@ def branch_manager_dashboard():
                         c_inf1, c_inf2 = st.columns([3, 2])
                         with c_inf1:
                             st.write(f"**Leave Dates:** `{row['StartDate']}` to `{row['EndDate']}`")
-                            st.write(f"**Applied On:** {row.get('ApplicationDate', 'N/A')}")
+                            st.write(f"**Submitted Date & Time:** `{row.get('ApplicationDate', 'N/A')}`")
                             st.write(f"**Reason / Remarks:** {row.get('Reason', 'N/A')}")
                             if row.get("EffectsServiceYear") == "Yes":
                                 st.warning("⚠️ This leave affects service tenure.")
@@ -9160,6 +9162,7 @@ def admin_dashboard():
                     is_adm_pend_act = _is_active_sheet_row(row)
                     with st.expander(f"{row['Name']} - {row['LeaveType']} ({row['TotalDays']} days)"):
                         st.write(f"**Dates:** {row['StartDate']} to {row['EndDate']}")
+                        st.write(f"**Submitted Date & Time:** `{row.get('ApplicationDate', 'N/A')}`")
                         st.write(f"**Department:** {row.get('Department', '')}")
                         if "Other" in str(row['LeaveType']) or row.get("EffectsServiceYear") == "Yes":
                             st.warning(f"🚨 **ATTENTION:** This is an '{row['LeaveType']}' leave. The employee has checked 'EffectsServiceYear = {row.get('EffectsServiceYear')}'. Please double-check if this type of leave (e.g. Education Leave) should delay their service year before approving!")
@@ -9656,6 +9659,7 @@ def coadmin_dashboard():
                     with st.expander(f"{row['Name']} requested {row['TotalDays']} days of {row['LeaveType']}"):
                         st.write(
                             f"**Dates:** {row['StartDate']} to {row['EndDate']}")
+                        st.write(f"**Submitted Date & Time:** `{row.get('ApplicationDate', 'N/A')}`")
                         st.write(f"**Department:** {row.get('Department', '')}")
                         if "Other" in str(row['LeaveType']) or row.get("EffectsServiceYear") == "Yes":
                             st.warning(
