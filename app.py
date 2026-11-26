@@ -7250,6 +7250,9 @@ def render_system_settings(is_admin=True):
                     rem_pen = init_tot_pen - (init_py * 365.0)
                     init_pm = int(rem_pen // 30.0)
                     init_pd = round((rem_pen - (init_pm * 30.0)) * 2.0) / 2.0
+                    if init_pm >= 12:
+                        init_py += init_pm // 12
+                        init_pm = init_pm % 12
                     st.session_state[peny_key] = init_py
                     st.session_state[penm_key] = init_pm
                     st.session_state[pend_key] = float(init_pd)
@@ -7258,11 +7261,17 @@ def render_system_settings(is_admin=True):
                     yv = max(0, int(st.session_state.get(yk, 0) or 0))
                     mv = max(0, int(st.session_state.get(mk, 0) or 0))
                     dv = max(0.0, float(st.session_state.get(dk, 0.0) or 0.0))
-                    tot_d = (yv * 365.0) + (mv * 30.0) + dv
-                    ny = int(tot_d // 365.0)
-                    rem = tot_d - (ny * 365.0)
-                    nm = int(rem // 30.0)
-                    nd = round((rem - (nm * 30.0)) * 2.0) / 2.0
+                    # 1. Roll 365+ days directly into years
+                    add_y_from_d = int(dv // 365.0)
+                    rem_d = dv - (add_y_from_d * 365.0)
+                    # 2. Roll 30+ remaining days into months
+                    add_m_from_d = int(rem_d // 30.0)
+                    nd = round((rem_d - (add_m_from_d * 30.0)) * 2.0) / 2.0
+                    # 3. Roll 12+ months into years
+                    tot_m = mv + add_m_from_d
+                    add_y_from_m = int(tot_m // 12)
+                    nm = int(tot_m % 12)
+                    ny = int(yv + add_y_from_d + add_y_from_m)
                     st.session_state[yk] = ny
                     st.session_state[mk] = nm
                     st.session_state[dk] = float(nd)
@@ -7271,22 +7280,25 @@ def render_system_settings(is_admin=True):
                 cur_pen_m = int(st.session_state.get(penm_key, 0) or 0)
                 cur_pen_d = float(st.session_state.get(pend_key, 0.0) or 0.0)
                 ed_svc_pen = max(0.0, (cur_pen_y * 365.0) + (cur_pen_m * 30.0) + cur_pen_d)
-                live_act_days = max(0.0, float(live_cal_days) - ed_svc_pen)
-                live_act_svc = round(live_act_days / 365.25, 2)
+                pen_years_equiv = float(cur_pen_y) + (float(cur_pen_m) / 12.0) + (float(cur_pen_d) / 365.0)
+                live_act_svc = round(max(0.0, float(live_svc_yr) - pen_years_equiv), 2)
+
+                # Force locked number_inputs to reflect live calculated values on every rerun
+                st.session_state[f"ed_svcyr_{e_user}"] = float(live_svc_yr)
+                st.session_state[f"ed_actsvc_{e_user}"] = float(live_act_svc)
 
                 with st.container(border=True):
                     st.markdown(
                         f"###### ⏳ Service Tenure & Penalty — "
-                        f"`Actual Service Year ({live_act_svc:.2f}y) = ((Today - JoiningDate) - Penalty ({ed_svc_pen:g}d)) / 365.25`"
+                        f"`Actual Service Year ({live_act_svc:.2f}y) = Service Year ({live_svc_yr:.2f}y) - Penalty ({pen_years_equiv:.2f}y / {ed_svc_pen:g}d)`"
                     )
                     st.caption(
                         "🔒 **Service Year** and **Actual Service Year** are locked (auto-calculated from `JoiningDate` to Today). "
-                        "Edit **Service Penalty** in **Years, Months, or Days** — typing `365` days automatically converts to `1 Year` (and `30` days to `1 Month`)."
+                        "Enter **Service Penalty** in **Years, Months, or Days** and click **🔄 Convert** (or press Enter) — `365 days → 1 Year`, `30 days → 1 Month`, `12 months → 1 Year`."
                     )
-                    c_sv1, c_py, c_pm, c_pd, c_sv3 = st.columns([1.3, 1.0, 1.0, 1.1, 1.3])
+                    c_sv1, c_py, c_pm, c_pd, c_conv, c_sv3 = st.columns([1.2, 0.9, 0.9, 1.0, 0.9, 1.2])
                     ed_svc_yr = c_sv1.number_input(
                         "Service Year 🔒",
-                        value=live_svc_yr,
                         step=0.01,
                         format="%.2f",
                         help=STAFF_MASTER_FIELD_HELP["Service Year"],
@@ -7307,7 +7319,7 @@ def render_system_settings(is_admin=True):
                         step=1,
                         key=penm_key,
                         on_change=_normalize_svc_penalty_ymd,
-                        help="Penalty months (1 Month = 30 days; 12+ months auto-converts to Years).",
+                        help="Penalty months (12 months converts to 1 Year).",
                     )
                     c_pd.number_input(
                         "Penalty (Days)",
@@ -7316,11 +7328,19 @@ def render_system_settings(is_admin=True):
                         format="%.1f",
                         key=pend_key,
                         on_change=_normalize_svc_penalty_ymd,
-                        help="Penalty days (type 365 days and press Enter to auto-convert to 1 Year; 30 days auto-converts to 1 Month).",
+                        help="Penalty days (365 days converts to 1 Year; 30 days converts to 1 Month).",
                     )
+                    with c_conv:
+                        st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
+                        st.button(
+                            "🔄 Convert",
+                            key=f"btn_conv_pen_{e_user}",
+                            on_click=_normalize_svc_penalty_ymd,
+                            use_container_width=True,
+                            help="Convert 365+ Days into Years, 30+ Days into Months, and 12+ Months into Years",
+                        )
                     ed_act_svc = c_sv3.number_input(
                         "Actual Service Year 🔒",
-                        value=live_act_svc,
                         step=0.01,
                         format="%.2f",
                         help=STAFF_MASTER_FIELD_HELP["Actual Service Year"],
@@ -7329,7 +7349,8 @@ def render_system_settings(is_admin=True):
                     )
                     st.caption(
                         f"📊 **Total Service Penalty:** `{cur_pen_y} Year(s), {cur_pen_m} Month(s), {cur_pen_d:g} Day(s)` "
-                        f"= **`{ed_svc_pen:g} total days`** (`{ed_svc_pen / 365.0:.2f} yr`)"
+                        f"= **`{ed_svc_pen:g} total days`** (`{pen_years_equiv:.2f} yr`) &nbsp;|&nbsp; "
+                        f"**Net Actual Service Year:** `{live_svc_yr:.2f}y - {pen_years_equiv:.2f}y =` **`{live_act_svc:.2f}y`**"
                     )
 
                 # Card 2B: Casual Leave (CL)
