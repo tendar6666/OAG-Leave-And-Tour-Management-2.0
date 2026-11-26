@@ -1298,12 +1298,14 @@ def inject_balance_formulas(df, df_req_override=None, reference_date=None, rules
         o_ul = sf(df_copy.at[df_copy.index[i], "Opening_UL"])
         a_ul = sf(df_copy.at[df_copy.index[i], "Addition_UL"])
         u_ul = sf(df_copy.at[df_copy.index[i], "Used_UL"])
+        cur_eff_ul = sf(df_copy.at[df_copy.index[i], "Current Year Leave affecting Service Year"]) if "Current Year Leave affecting Service Year" in df_copy.columns else 0.0
+        tot_pr_days = u_ul + cur_eff_ul
 
         if auto_pro_rata:
-            if u_ul > 0.0:
-                df_copy.at[df_copy.index[i], "Penalty_CL(UL Effect)"] = round((u_ul / 30.0) * max(0.0, cl_pr_rate) * 2.0) / 2.0
-                df_copy.at[df_copy.index[i], "Penalty_SL(UL Effect)"] = round((u_ul / 30.0) * max(0.0, sl_pr_rate) * 2.0) / 2.0
-                df_copy.at[df_copy.index[i], "Penalty_AL(UL Effect)"] = round((u_ul / 30.0) * max(0.0, al_pr_rate) * 2.0) / 2.0
+            if tot_pr_days > 0.0:
+                df_copy.at[df_copy.index[i], "Penalty_CL(UL Effect)"] = round((tot_pr_days / 30.0) * max(0.0, cl_pr_rate) * 2.0) / 2.0
+                df_copy.at[df_copy.index[i], "Penalty_SL(UL Effect)"] = round((tot_pr_days / 30.0) * max(0.0, sl_pr_rate) * 2.0) / 2.0
+                df_copy.at[df_copy.index[i], "Penalty_AL(UL Effect)"] = round((tot_pr_days / 30.0) * max(0.0, al_pr_rate) * 2.0) / 2.0
             else:
                 df_copy.at[df_copy.index[i], "Penalty_CL(UL Effect)"] = 0.0
                 df_copy.at[df_copy.index[i], "Penalty_SL(UL Effect)"] = 0.0
@@ -5042,20 +5044,22 @@ def employee_dashboard(hide_title=False):
         hard_blocks = validation_res["hard_blocks"] if not is_reversal else []
         policy_alerts = validation_res["policy_alerts"] if not is_reversal else []
 
-        for hb_msg in hard_blocks:
-            st.error(hb_msg)
-
-        for pa_msg in policy_alerts:
-            st.warning(pa_msg)
+        current_form_sig = f"{st.session_state.user_name}|{leave_type}|{start_date}|{start_half}|{end_date}|{end_half}|{is_reversal}"
+        show_validation_on_submit = (st.session_state.get("_leave_submit_attempted_sig") == current_form_sig)
 
         force_apply = False
-        if not hard_blocks and policy_alerts:
-            force_apply = st.checkbox(
-                "Force Apply anyway (override weekend policy alert for regional/working calendars)",
-                key=f"force_apply_{st.session_state.user_name}_{leave_type}_{start_date}_{start_half}_{end_date}_{end_half}",
-            )
+        if show_validation_on_submit:
+            for hb_msg in hard_blocks:
+                st.error(hb_msg)
 
-        has_submission_block = bool(hard_blocks) or (bool(policy_alerts) and not force_apply)
+            for pa_msg in policy_alerts:
+                st.warning(pa_msg)
+
+            if not hard_blocks and policy_alerts:
+                force_apply = st.checkbox(
+                    "Force Apply anyway (override weekend policy alert for regional/working calendars)",
+                    key=f"force_apply_{st.session_state.user_name}_{leave_type}_{start_date}_{start_half}_{end_date}_{end_half}",
+                )
 
         st.write("---")
         col_sub, col_prev = st.columns(2)
@@ -5100,14 +5104,17 @@ def employee_dashboard(hide_title=False):
             "Submit Reversal" if is_reversal else "Submit Request",
             type="primary",
             key="btn_submit_leave",
-            disabled=(has_submission_block or is_submit_busy),
+            disabled=is_submit_busy,
             on_click=_arm_submission_freeze,
             args=(leave_submit_kind,),
         )
         if leave_clicked or st.session_state.get("_submit_pending_kind") in ("leave_request", "leave_reversal"):
-            def _fail_leave_submit(err_msg):
+            def _fail_leave_submit(err_msg, mark_attempted=False):
                 _release_submission_freeze()
-                st.session_state["_submit_flash_leave"] = ("error", err_msg)
+                if mark_attempted:
+                    st.session_state["_leave_submit_attempted_sig"] = current_form_sig
+                else:
+                    st.session_state["_submit_flash_leave"] = ("error", err_msg)
                 freeze_placeholder.empty()
                 st.rerun()
 
@@ -5142,11 +5149,12 @@ def employee_dashboard(hide_title=False):
                             is_reversal=is_reversal,
                         )
                         if not is_reversal and fresh_val["hard_blocks"]:
-                            _fail_leave_submit("\n\n".join(fresh_val["hard_blocks"]))
+                            _fail_leave_submit("\n\n".join(fresh_val["hard_blocks"]), mark_attempted=True)
                         elif not is_reversal and fresh_val["policy_alerts"] and not force_apply:
                             _fail_leave_submit(
                                 "\n\n".join(fresh_val["policy_alerts"])
-                                + "\n\nPlease tick 'Force Apply anyway' above to submit with a Policy Alert."
+                                + "\n\nPlease tick 'Force Apply anyway' above to submit with a Policy Alert.",
+                                mark_attempted=True,
                             )
                         else:
                             req_id = st.session_state.get("_submit_request_id") or _make_submission_token(leave_submit_kind)
@@ -5228,6 +5236,7 @@ def employee_dashboard(hide_title=False):
                                 req_title,
                                 f"{st.session_state.user_name} {action_word} {total_days} day(s) of {leave_type}. (FYI - Pending Approval)"
                             )
+                            st.session_state.pop("_leave_submit_attempted_sig", None)
                             st.session_state["_submit_flash_leave"] = (
                                 "success",
                                 "✅ Leave reversal request submitted successfully!" if is_reversal else "✅ Leave request submitted successfully!",
@@ -6912,188 +6921,277 @@ def render_system_settings(is_admin=True):
 
         # Section A: Add New Staff (Complete Onboarding with Full Leave & Service Ledger)
         with st.expander("➕ Add New Staff Member & Initial Leave Ledger", expanded=False):
-            with st.form("admin_add_staff_form"):
-                st.markdown("##### 1. Staff Profile & Login Credentials")
-                st.caption("Hover over any **`(?)`** icon to see the field's **Note & Formula**.")
-                c_n1, c_n2 = st.columns(2)
-                with c_n1:
-                    new_name = st.text_input(
-                        "Full Name (Tibetan Font) *",
-                        placeholder="e.g. བསྟན་འཛིན་བསྟན་དར།",
-                        help=STAFF_MASTER_FIELD_HELP["Name"],
-                    )
-                    new_post = st.text_input(
-                        "Designation / Post (Tibetan Font) *",
-                        placeholder="e.g. ལས་དོ།",
-                        help=STAFF_MASTER_FIELD_HELP["Post"],
-                    )
-                    new_join = st.date_input(
-                        "Official Joining Date *",
-                        value=get_cta_today(),
-                        min_value=date(1960, 1, 1),
-                        max_value=date(2035, 12, 31),
-                        help=STAFF_MASTER_FIELD_HELP["JoiningDate"],
-                    )
-                    new_active_fy = st.text_input(
-                        "Active Financial Year (Active_FY)",
-                        value=get_current_financial_year_dates()[2],
-                        help=STAFF_MASTER_FIELD_HELP["Active_FY"],
-                        disabled=True,
-                    )
-                with c_n2:
-                    add_role_opts = (
-                        ["Employee", "Co-Admin", "Accounts", "Branch Manager", "Auditor", "Admin"]
-                        if is_admin
-                        else (["Employee", "Co-Admin", "Accounts", "Branch Manager", "Auditor"] if is_central_viewer else ["Employee", "Accounts"])
-                    )
-                    add_branch_opts = ["HQ", "DB", "NB", "SB", "Other"] if is_central_viewer else [viewer_branch]
-                    new_role = st.selectbox(
-                        "System Role *",
-                        add_role_opts,
-                        help=STAFF_MASTER_FIELD_HELP["Role"],
-                    )
-                    new_branch = st.selectbox(
-                        "Branch / Office *",
-                        add_branch_opts,
-                        format_func=lambda b: BRANCH_NAMES.get(b, b),
-                        help=STAFF_MASTER_FIELD_HELP["Branch"],
-                    )
-                    new_email = st.text_input(
-                        "Staff Gmail Address *",
-                        placeholder="e.g. tendar@gmail.com",
-                        help=STAFF_MASTER_FIELD_HELP["Email"],
-                    )
-                    new_pin = st.text_input(
-                        "Initial 4-Digit PIN *",
-                        type="password",
-                        max_chars=4,
-                        help=STAFF_MASTER_FIELD_HELP["PIN"],
-                    )
-
-                st.markdown("##### 2. Initial Leave Balances & Historical Service Ledger (`Staff_Master`)")
-                st.caption(
-                    "Grouped by leave category for simplicity. Hover or click **`(?)`** next to any field (e.g. `Opening_SL`, `Addition_SL`) to see its **Note & Formula**."
+            st.markdown("##### 1. Staff Profile & Login Credentials")
+            st.caption("Hover over any **`(?)`** icon to see the field's **Note & Formula**. Only **🟨 Manual Input** columns are editable; all **🔒 Formula** columns calculate automatically.")
+            c_n1, c_n2 = st.columns(2)
+            with c_n1:
+                new_name = st.text_input(
+                    "Full Name (Tibetan Font) *",
+                    placeholder="e.g. བསྟན་འཛིན་བསྟན་དར།",
+                    help=STAFF_MASTER_FIELD_HELP["Name"],
+                    key="add_stf_name",
+                )
+                new_post = st.text_input(
+                    "Designation / Post (Tibetan Font) *",
+                    placeholder="e.g. ལས་དོ།",
+                    help=STAFF_MASTER_FIELD_HELP["Post"],
+                    key="add_stf_post",
+                )
+                new_join = st.date_input(
+                    "Official Joining Date *",
+                    value=get_cta_today(),
+                    min_value=date(1960, 1, 1),
+                    max_value=date(2035, 12, 31),
+                    help=STAFF_MASTER_FIELD_HELP["JoiningDate"],
+                    key="add_stf_join",
+                )
+                new_active_fy = st.text_input(
+                    "Active Financial Year (Active_FY) 🔒",
+                    value=get_current_financial_year_dates()[2],
+                    help=STAFF_MASTER_FIELD_HELP["Active_FY"],
+                    disabled=True,
+                    key="add_stf_fy",
+                )
+            with c_n2:
+                add_role_opts = (
+                    ["Employee", "Co-Admin", "Accounts", "Branch Manager", "Auditor", "Admin"]
+                    if is_admin
+                    else (["Employee", "Co-Admin", "Accounts", "Branch Manager", "Auditor"] if is_central_viewer else ["Employee", "Accounts"])
+                )
+                add_branch_opts = ["HQ", "DB", "NB", "SB", "Other"] if is_central_viewer else [viewer_branch]
+                new_role = st.selectbox(
+                    "System Role *",
+                    add_role_opts,
+                    help=STAFF_MASTER_FIELD_HELP["Role"],
+                    key="add_stf_role",
+                )
+                new_branch = st.selectbox(
+                    "Branch / Office *",
+                    add_branch_opts,
+                    format_func=lambda b: BRANCH_NAMES.get(b, b),
+                    help=STAFF_MASTER_FIELD_HELP["Branch"],
+                    key="add_stf_branch",
+                )
+                new_email = st.text_input(
+                    "Staff Gmail Address *",
+                    placeholder="e.g. tendar@gmail.com",
+                    help=STAFF_MASTER_FIELD_HELP["Email"],
+                    key="add_stf_email",
+                )
+                new_pin = st.text_input(
+                    "Initial 4-Digit PIN *",
+                    type="password",
+                    max_chars=4,
+                    help=STAFF_MASTER_FIELD_HELP["PIN"],
+                    key="add_stf_pin",
                 )
 
-                def_q_cl = float(lt_rules_u.get("CL", {}).get("Annual_Quota", 9.0))
-                def_q_sl = float(lt_rules_u.get("SL", {}).get("Annual_Quota", 30.0))
-                def_q_al = float(lt_rules_u.get("AL", {}).get("Annual_Quota", 30.0))
-                def_q_ul = float(lt_rules_u.get("UL", {}).get("Annual_Quota", 0.0))
-                def_cap_al = float(lt_rules_u.get("AL", {}).get("Max_Accumulation_Cap", 180.0))
+            st.markdown("##### 2. Initial Leave Balances & Historical Service Ledger (`Staff_Master`)")
+            st.caption(
+                "Only **🟨 Manual Input** columns are editable below. All **🔒 Locked Formula** columns calculate live automatically using the exact Excel formulas."
+            )
 
-                with st.container(border=True):
-                    st.markdown("###### 🟦 Casual Leave (CL) — `Formula: Balance_CL = max(0, Opening_CL + Addition_CL - Penalty_CL - Used_CL)`")
-                    c_cl1, c_cl2, c_cl3, c_cl4 = st.columns(4)
-                    new_o_cl = c_cl1.number_input("Opening_CL", value=0.0, step=0.5, help=STAFF_MASTER_FIELD_HELP["Opening_CL"])
-                    new_a_cl = c_cl2.number_input("Addition_CL", value=def_q_cl, step=0.5, help=STAFF_MASTER_FIELD_HELP["Addition_CL"])
-                    new_p_cl = c_cl3.number_input("Penalty_CL(UL Effect)", value=0.0, step=0.5, help=STAFF_MASTER_FIELD_HELP["Penalty_CL(UL Effect)"])
-                    new_u_cl = c_cl4.number_input("Used_CL", value=0.0, step=0.5, help=STAFF_MASTER_FIELD_HELP["Used_CL"])
+            def_q_cl = float(lt_rules_u.get("CL", {}).get("Annual_Quota", 9.0))
+            def_q_sl = float(lt_rules_u.get("SL", {}).get("Annual_Quota", 30.0))
+            def_q_al = float(lt_rules_u.get("AL", {}).get("Annual_Quota", 30.0))
+            def_cap_al = float(lt_rules_u.get("AL", {}).get("Max_Accumulation_Cap", 180.0))
+            cl_pr_r = float(lt_rules_u.get("CL", {}).get("Pro_Rata_UL_Penalty", 0.75))
+            sl_pr_r = float(lt_rules_u.get("SL", {}).get("Pro_Rata_UL_Penalty", 2.50))
+            al_pr_r = float(lt_rules_u.get("AL", {}).get("Pro_Rata_UL_Penalty", 2.50))
+            ul_cap_add = float(gl_rules_u.get("UL_Career_Max_Cap", 730.0))
 
-                with st.container(border=True):
-                    st.markdown("###### 🟩 Sick Leave (SL) — `Formula: Balance_SL = max(0, Opening_SL + Addition_SL - Penalty_SL - Used_SL)`")
-                    c_sl1, c_sl2, c_sl3, c_sl4 = st.columns(4)
-                    new_o_sl = c_sl1.number_input("Opening_SL", value=0.0, step=0.5, help=STAFF_MASTER_FIELD_HELP["Opening_SL"])
-                    new_a_sl = c_sl2.number_input("Addition_SL", value=def_q_sl, step=0.5, help=STAFF_MASTER_FIELD_HELP["Addition_SL"])
-                    new_p_sl = c_sl3.number_input("Penalty_SL(UL Effect)", value=0.0, step=0.5, help=STAFF_MASTER_FIELD_HELP["Penalty_SL(UL Effect)"])
-                    new_u_sl = c_sl4.number_input("Used_SL", value=0.0, step=0.5, help=STAFF_MASTER_FIELD_HELP["Used_SL"])
+            # Pre-read current UL & Service-Affecting inputs from session_state so Tenure & CL/SL/AL Penalty formulas update live
+            cur_add_o_ul = float(st.session_state.get("add_o_ul", 0.0) or 0.0)
+            cur_add_u_ul = float(st.session_state.get("add_u_ul", 0.0) or 0.0)
+            cur_add_cum_ul = float(st.session_state.get("add_cum_ul", 0.0) or 0.0)
+            cur_add_cur_eff = float(st.session_state.get("add_cur_eff", 0.0) or 0.0)
+            cur_add_cum_eff = float(st.session_state.get("add_cum_eff", 0.0) or 0.0)
 
-                with st.container(border=True):
-                    st.markdown(f"###### 🟨 Annual Leave (AL) — `Formula: Balance_AL = min({def_cap_al:g}, max(0, Opening_AL + Addition_AL - Penalty_AL - Used_AL - Encashed_AL))`")
-                    c_al1, c_al2, c_al3, c_al4, c_al5 = st.columns(5)
-                    new_o_al = c_al1.number_input("Opening_AL", value=0.0, step=0.5, help=STAFF_MASTER_FIELD_HELP["Opening_AL"])
-                    new_a_al = c_al2.number_input("Addition_AL", value=def_q_al, step=0.5, help=STAFF_MASTER_FIELD_HELP["Addition_AL"])
-                    new_p_al = c_al3.number_input("Penalty_AL(UL Effect)", value=0.0, step=0.5, help=STAFF_MASTER_FIELD_HELP["Penalty_AL(UL Effect)"])
-                    new_u_al = c_al4.number_input("Used_AL", value=0.0, step=0.5, help=STAFF_MASTER_FIELD_HELP["Used_AL"])
-                    new_e_al = c_al5.number_input("Encashed_AL", value=0.0, step=0.5, help=STAFF_MASTER_FIELD_HELP["Encashed_AL"])
+            add_cal_days = max(0, (get_cta_today() - new_join).days)
+            add_svc_yr = round(add_cal_days / 365.25, 2)
+            add_svc_pen = max(0.0, cur_add_cum_ul + cur_add_u_ul + cur_add_cur_eff + cur_add_cum_eff)
+            add_act_svc = round(max(0.0, (float(add_cal_days) - add_svc_pen) / 365.25), 2)
+            add_pen_yrs = add_svc_pen / 365.25
 
-                with st.container(border=True):
-                    st.markdown("###### 🟪 Unpaid Leave (UL) & Service-Affecting Leave — `Formula: Balance_UL = max(0, Opening_UL + Addition_UL - Used_UL)`")
-                    c_ul1, c_ul2, c_ul3, c_ul4, c_ul5 = st.columns(5)
-                    new_o_ul = c_ul1.number_input("Opening_UL", value=0.0, step=0.5, help=STAFF_MASTER_FIELD_HELP["Opening_UL"])
-                    new_a_ul = c_ul2.number_input("Addition_UL", value=def_q_ul, step=0.5, help=STAFF_MASTER_FIELD_HELP["Addition_UL"])
-                    new_u_ul = c_ul3.number_input("Used_UL", value=0.0, step=0.5, help=STAFF_MASTER_FIELD_HELP["Used_UL"])
-                    new_cum_ul = c_ul4.number_input("Cumulative_UL", value=0.0, step=0.5, help=STAFF_MASTER_FIELD_HELP["Cumulative_UL"])
-                    new_ms_ul = c_ul5.selectbox(
-                        "Last_UL_Milestone (Yrs)",
-                        [0.0, 5.0, 10.0, 15.0, 20.0],
-                        index=0,
-                        help=STAFF_MASTER_FIELD_HELP["Last_UL_Milestone"],
-                    )
+            st.session_state["add_svcyr_lock"] = float(add_svc_yr)
+            st.session_state["add_svcpen_lock"] = float(add_svc_pen)
+            st.session_state["add_actsvc_lock"] = float(add_act_svc)
 
-                    c_ef1, c_ef2 = st.columns(2)
-                    new_cur_eff = c_ef1.number_input(
-                        "Current Year Leave affecting Service Year",
-                        value=0.0,
-                        step=0.5,
-                        help=STAFF_MASTER_FIELD_HELP["Current Year Leave affecting Service Year"],
-                    )
-                    new_cum_eff = c_ef2.number_input(
-                        "Cummulative leave effecting Service year.(Education Leave & Etc).",
-                        value=0.0,
-                        step=0.5,
-                        help=STAFF_MASTER_FIELD_HELP["Cummulative leave effecting Service year.(Education Leave & Etc)."],
-                    )
+            with st.container(border=True):
+                st.markdown(
+                    f"###### ⏳ Service Tenure & Penalty — "
+                    f"`Actual Service Year ({add_act_svc:.2f}y) = Service Year ({add_svc_yr:.2f}y) - Penalty ({add_pen_yrs:.2f}y / {add_svc_pen:g}d)`"
+                )
+                c_as1, c_as2, c_as3 = st.columns(3)
+                c_as1.number_input("Service Year 🔒", step=0.01, format="%.2f", help=STAFF_MASTER_FIELD_HELP["Service Year"], key="add_svcyr_lock", disabled=True)
+                c_as2.number_input("Service Year Penalty 🔒", step=0.5, help=STAFF_MASTER_FIELD_HELP["Service Year Penalty"], key="add_svcpen_lock", disabled=True)
+                c_as3.number_input("Actual Service Year 🔒", step=0.01, format="%.2f", help=STAFF_MASTER_FIELD_HELP["Actual Service Year"], key="add_actsvc_lock", disabled=True)
 
-                if st.form_submit_button("Create Staff Member & Save All Balances", type="primary"):
-                    if not new_name.strip() or not new_post.strip():
-                        st.error("Name and Post are required.")
-                    elif not new_email.strip() or "@" not in new_email:
-                        st.error("A valid Gmail address is required for security.")
-                    elif len(new_pin.strip()) != 4 or not new_pin.strip().isdigit():
-                        st.error("PIN must be exactly 4 numeric digits.")
-                    elif users_df is not None and new_name.strip() in users_df["Name"].astype(str).str.strip().values:
-                        st.error(f"User with name '{new_name.strip()}' already exists!")
-                    elif users_df is not None and new_email.strip().lower() in users_df["Email"].astype(str).str.strip().str.lower().values:
-                        st.error(f"A user with Gmail '{new_email.strip().lower()}' already exists!")
-                    else:
-                        with st.spinner("Adding new staff member and calculating balances..."):
-                            new_topic = generate_user_ntfy_topic()
+            new_p_cl = round(((cur_add_u_ul + cur_add_cur_eff) / 30.0) * cl_pr_r * 2.0) / 2.0 if (cur_add_u_ul + cur_add_cur_eff) > 0 else 0.0
+            new_p_sl = round(((cur_add_u_ul + cur_add_cur_eff) / 30.0) * sl_pr_r * 2.0) / 2.0 if (cur_add_u_ul + cur_add_cur_eff) > 0 else 0.0
+            new_p_al = round(((cur_add_u_ul + cur_add_cur_eff) / 30.0) * al_pr_r * 2.0) / 2.0 if (cur_add_u_ul + cur_add_cur_eff) > 0 else 0.0
 
-                            init_bal_cl = max(0.0, new_o_cl + new_a_cl - new_p_cl - new_u_cl)
-                            init_bal_sl = max(0.0, new_o_sl + new_a_sl - new_p_sl - new_u_sl)
-                            raw_init_al = max(0.0, new_o_al + new_a_al - new_p_al - new_u_al - new_e_al)
-                            init_bal_al = min(def_cap_al, raw_init_al) if def_cap_al > 0 else raw_init_al
-                            init_bal_ul = max(0.0, new_o_ul + new_a_ul - new_u_ul)
+            with st.container(border=True):
+                cur_ao_cl = float(st.session_state.get("add_o_cl", 0.0) or 0.0)
+                cur_aa_cl = float(st.session_state.get("add_a_cl", def_q_cl) if "add_a_cl" in st.session_state else def_q_cl)
+                cur_au_cl = float(st.session_state.get("add_u_cl", 0.0) or 0.0)
+                live_ab_cl = max(0.0, cur_ao_cl + cur_aa_cl - new_p_cl - cur_au_cl)
+                st.session_state["add_p_cl_lock"] = float(new_p_cl)
+                st.session_state["add_b_cl_lock"] = float(live_ab_cl)
+                st.markdown(
+                    f"###### 🟦 Casual Leave (CL) — "
+                    f"`Formula: Balance_CL ({live_ab_cl:g}) = max(0, Opening ({cur_ao_cl:g}) + Addition ({cur_aa_cl:g}) - Penalty ({new_p_cl:g}) - Used ({cur_au_cl:g}))`"
+                )
+                c_cl1, c_cl2, c_cl3, c_cl4, c_cl5 = st.columns(5)
+                new_o_cl = c_cl1.number_input("Opening_CL", value=0.0, step=0.5, help=STAFF_MASTER_FIELD_HELP["Opening_CL"], key="add_o_cl")
+                new_a_cl = c_cl2.number_input("Addition_CL", value=def_q_cl, step=0.5, help=STAFF_MASTER_FIELD_HELP["Addition_CL"], key="add_a_cl")
+                c_cl3.number_input("Penalty_CL(UL Effect) 🔒", step=0.5, help=STAFF_MASTER_FIELD_HELP["Penalty_CL(UL Effect)"], key="add_p_cl_lock", disabled=True)
+                new_u_cl = c_cl4.number_input("Used_CL", value=0.0, step=0.5, help=STAFF_MASTER_FIELD_HELP["Used_CL"], key="add_u_cl")
+                c_cl5.number_input("Balance_CL 🔒", step=0.5, help=STAFF_MASTER_FIELD_HELP["Balance_CL"], key="add_b_cl_lock", disabled=True)
 
-                            is_auditor_role = (str(new_role).strip() == "Auditor")
-                            new_u_row = pd.DataFrame([{
+            with st.container(border=True):
+                cur_ao_sl = float(st.session_state.get("add_o_sl", 0.0) or 0.0)
+                cur_aa_sl = float(st.session_state.get("add_a_sl", def_q_sl) if "add_a_sl" in st.session_state else def_q_sl)
+                cur_au_sl = float(st.session_state.get("add_u_sl", 0.0) or 0.0)
+                live_ab_sl = max(0.0, cur_ao_sl + cur_aa_sl - new_p_sl - cur_au_sl)
+                st.session_state["add_p_sl_lock"] = float(new_p_sl)
+                st.session_state["add_b_sl_lock"] = float(live_ab_sl)
+                st.markdown(
+                    f"###### 🟩 Sick Leave (SL) — "
+                    f"`Formula: Balance_SL ({live_ab_sl:g}) = max(0, Opening ({cur_ao_sl:g}) + Addition ({cur_aa_sl:g}) - Penalty ({new_p_sl:g}) - Used ({cur_au_sl:g}))`"
+                )
+                c_sl1, c_sl2, c_sl3, c_sl4, c_sl5 = st.columns(5)
+                new_o_sl = c_sl1.number_input("Opening_SL", value=0.0, step=0.5, help=STAFF_MASTER_FIELD_HELP["Opening_SL"], key="add_o_sl")
+                new_a_sl = c_sl2.number_input("Addition_SL", value=def_q_sl, step=0.5, help=STAFF_MASTER_FIELD_HELP["Addition_SL"], key="add_a_sl")
+                c_sl3.number_input("Penalty_SL(UL Effect) 🔒", step=0.5, help=STAFF_MASTER_FIELD_HELP["Penalty_SL(UL Effect)"], key="add_p_sl_lock", disabled=True)
+                new_u_sl = c_sl4.number_input("Used_SL", value=0.0, step=0.5, help=STAFF_MASTER_FIELD_HELP["Used_SL"], key="add_u_sl")
+                c_sl5.number_input("Balance_SL 🔒", step=0.5, help=STAFF_MASTER_FIELD_HELP["Balance_SL"], key="add_b_sl_lock", disabled=True)
+
+            with st.container(border=True):
+                cur_ao_al = float(st.session_state.get("add_o_al", 0.0) or 0.0)
+                cur_aa_al = float(st.session_state.get("add_a_al", def_q_al) if "add_a_al" in st.session_state else def_q_al)
+                cur_au_al = float(st.session_state.get("add_u_al", 0.0) or 0.0)
+                cur_ae_al = float(st.session_state.get("add_e_al", 0.0) or 0.0)
+                raw_ab_al = max(0.0, cur_ao_al + cur_aa_al - new_p_al - cur_au_al - cur_ae_al)
+                live_ab_al = min(def_cap_al, raw_ab_al) if def_cap_al > 0 else raw_ab_al
+                st.session_state["add_p_al_lock"] = float(new_p_al)
+                st.session_state["add_b_al_lock"] = float(live_ab_al)
+                st.markdown(
+                    f"###### 🟨 Annual Leave (AL) — "
+                    f"`Formula: Balance_AL ({live_ab_al:g}) = min({def_cap_al:g}, max(0, Opening ({cur_ao_al:g}) + Addition ({cur_aa_al:g}) - Penalty ({new_p_al:g}) - Used ({cur_au_al:g}) - Encashed ({cur_ae_al:g})))`"
+                )
+                c_al1, c_al2, c_al3, c_al4, c_al5, c_al6 = st.columns(6)
+                new_o_al = c_al1.number_input("Opening_AL", value=0.0, step=0.5, help=STAFF_MASTER_FIELD_HELP["Opening_AL"], key="add_o_al")
+                new_a_al = c_al2.number_input("Addition_AL", value=def_q_al, step=0.5, help=STAFF_MASTER_FIELD_HELP["Addition_AL"], key="add_a_al")
+                c_al3.number_input("Penalty_AL(UL Effect) 🔒", step=0.5, help=STAFF_MASTER_FIELD_HELP["Penalty_AL(UL Effect)"], key="add_p_al_lock", disabled=True)
+                new_u_al = c_al4.number_input("Used_AL", value=0.0, step=0.5, help=STAFF_MASTER_FIELD_HELP["Used_AL"], key="add_u_al")
+                new_e_al = c_al5.number_input("Encashed_AL", value=0.0, step=0.5, help=STAFF_MASTER_FIELD_HELP["Encashed_AL"], key="add_e_al")
+                c_al6.number_input("Balance_AL 🔒", step=0.5, help=STAFF_MASTER_FIELD_HELP["Balance_AL"], key="add_b_al_lock", disabled=True)
+
+            with st.container(border=True):
+                new_ms_ul = float(min(20, int(add_act_svc // 5) * 5))
+                add_ul_pool = cur_add_o_ul + cur_add_cum_ul
+                if (
+                    (new_ms_ul == 5.0 and add_ul_pool < 182.5)
+                    or (new_ms_ul == 10.0 and add_ul_pool < 365.0)
+                    or (new_ms_ul == 15.0 and add_ul_pool < 547.5)
+                    or (new_ms_ul >= 20.0 and add_ul_pool < 730.0)
+                ):
+                    new_a_ul = 182.5
+                else:
+                    new_a_ul = 0.0
+                live_ab_ul = max(0.0, cur_add_o_ul + new_a_ul - cur_add_u_ul)
+                st.session_state["add_a_ul_lock"] = float(new_a_ul)
+                st.session_state["add_b_ul_lock"] = float(live_ab_ul)
+                st.session_state["add_ms_ul_lock"] = float(new_ms_ul)
+                st.markdown(
+                    f"###### 🟪 Unpaid Leave (UL) & Service-Affecting Leave — "
+                    f"`Formula: Balance_UL ({live_ab_ul:g}) = max(0, Opening ({cur_add_o_ul:g}) + Addition ({new_a_ul:g}) - Used ({cur_add_u_ul:g})) | Career Cap ≤ {ul_cap_add:g}d`"
+                )
+                c_ul1, c_ul2, c_ul3, c_ul4, c_ul5, c_ul6 = st.columns(6)
+                new_o_ul = c_ul1.number_input("Opening_UL", value=0.0, step=0.5, help=STAFF_MASTER_FIELD_HELP["Opening_UL"], key="add_o_ul")
+                c_ul2.number_input("Addition_UL 🔒", step=0.5, help=STAFF_MASTER_FIELD_HELP["Addition_UL"], key="add_a_ul_lock", disabled=True)
+                new_u_ul = c_ul3.number_input("Used_UL", value=0.0, step=0.5, help=STAFF_MASTER_FIELD_HELP["Used_UL"], key="add_u_ul")
+                c_ul4.number_input("Balance_UL 🔒", step=0.5, help=STAFF_MASTER_FIELD_HELP["Balance_UL"], key="add_b_ul_lock", disabled=True)
+                new_cum_ul = c_ul5.number_input("Cumulative_UL", value=0.0, step=0.5, help=STAFF_MASTER_FIELD_HELP["Cumulative_UL"], key="add_cum_ul")
+                c_ul6.number_input("Last_UL_Milestone 🔒", step=5.0, help=STAFF_MASTER_FIELD_HELP["Last_UL_Milestone"], key="add_ms_ul_lock", disabled=True)
+
+                c_ef1, c_ef2 = st.columns(2)
+                new_cur_eff = c_ef1.number_input(
+                    "Current Year Leave affecting Service Year",
+                    value=0.0,
+                    step=0.5,
+                    help=STAFF_MASTER_FIELD_HELP["Current Year Leave affecting Service Year"],
+                    key="add_cur_eff",
+                )
+                new_cum_eff = c_ef2.number_input(
+                    "Cummulative leave effecting Service year.(Education Leave & Etc).",
+                    value=0.0,
+                    step=0.5,
+                    help=STAFF_MASTER_FIELD_HELP["Cummulative leave effecting Service year.(Education Leave & Etc)."],
+                    key="add_cum_eff",
+                )
+
+            if st.button("Create Staff Member & Save All Balances", type="primary", key="btn_create_new_staff"):
+                if not new_name.strip() or not new_post.strip():
+                    st.error("Name and Post are required.")
+                elif not new_email.strip() or "@" not in new_email:
+                    st.error("A valid Gmail address is required for security.")
+                elif len(new_pin.strip()) != 4 or not new_pin.strip().isdigit():
+                    st.error("PIN must be exactly 4 numeric digits.")
+                elif users_df is not None and new_name.strip() in users_df["Name"].astype(str).str.strip().values:
+                    st.error(f"User with name '{new_name.strip()}' already exists!")
+                elif users_df is not None and new_email.strip().lower() in users_df["Email"].astype(str).str.strip().str.lower().values:
+                    st.error(f"A user with Gmail '{new_email.strip().lower()}' already exists!")
+                else:
+                    with st.spinner("Adding new staff member and calculating balances..."):
+                        new_topic = generate_user_ntfy_topic()
+
+                        init_bal_cl = max(0.0, new_o_cl + new_a_cl - new_p_cl - new_u_cl)
+                        init_bal_sl = max(0.0, new_o_sl + new_a_sl - new_p_sl - new_u_sl)
+                        raw_init_al = max(0.0, new_o_al + new_a_al - new_p_al - new_u_al - new_e_al)
+                        init_bal_al = min(def_cap_al, raw_init_al) if def_cap_al > 0 else raw_init_al
+                        init_bal_ul = max(0.0, new_o_ul + new_a_ul - new_u_ul)
+
+                        is_auditor_role = (str(new_role).strip() == "Auditor")
+                        new_u_row = pd.DataFrame([{
+                            "Name": new_name.strip(),
+                            "PIN": str(new_pin.strip()),
+                            "Role": new_role,
+                            "Post": new_post.strip(),
+                            "JoiningDate": "" if is_auditor_role else new_join.strftime("%Y-%m-%d"),
+                            "NtfyTopic": new_topic,
+                            "Branch": new_branch,
+                            "Email": new_email.strip().lower()
+                        }])
+
+                        _gsheets_retry(conn.update, worksheet="Users", data=pd.concat([users_df, new_u_row], ignore_index=True))
+                        if is_auditor_role:
+                            _invalidate_sheet_cache("Users")
+                            st.success(f"✅ Added Auditor {new_name.strip()} ({new_email.strip().lower()}) with read-only oversight (no leave/tour balance) and private channel: {new_topic}")
+                            st.rerun()
+                        else:
+                            new_sm_row = pd.DataFrame([{
                                 "Name": new_name.strip(),
-                                "PIN": str(new_pin.strip()),
-                                "Role": new_role,
                                 "Post": new_post.strip(),
-                                "JoiningDate": "" if is_auditor_role else new_join.strftime("%Y-%m-%d"),
-                                "NtfyTopic": new_topic,
+                                "JoiningDate": new_join.strftime("%Y-%m-%d"),
+                                "Service Year": add_svc_yr, "Service Year Penalty": add_svc_pen, "Actual Service Year": add_act_svc,
+                                "Opening_CL": new_o_cl, "Addition_CL": new_a_cl, "Penalty_CL(UL Effect)": new_p_cl, "Used_CL": new_u_cl, "Balance_CL": init_bal_cl,
+                                "Opening_SL": new_o_sl, "Addition_SL": new_a_sl, "Penalty_SL(UL Effect)": new_p_sl, "Used_SL": new_u_sl, "Balance_SL": init_bal_sl,
+                                "Opening_AL": new_o_al, "Addition_AL": new_a_al, "Penalty_AL(UL Effect)": new_p_al, "Used_AL": new_u_al, "Encashed_AL": new_e_al, "Balance_AL": init_bal_al,
+                                "Opening_UL": new_o_ul, "Addition_UL": new_a_ul, "Used_UL": new_u_ul, "Balance_UL": init_bal_ul,
+                                "Cumulative_UL": new_cum_ul, "Last_UL_Milestone": float(new_ms_ul),
+                                "Current Year Leave affecting Service Year": new_cur_eff,
+                                "Cummulative leave effecting Service year.(Education Leave & Etc).": new_cum_eff,
                                 "Branch": new_branch,
-                                "Email": new_email.strip().lower()
+                                "Active_FY": str(new_active_fy).strip() or get_current_financial_year_dates()[2]
                             }])
 
-                            _gsheets_retry(conn.update, worksheet="Users", data=pd.concat([users_df, new_u_row], ignore_index=True))
-                            if is_auditor_role:
-                                _invalidate_sheet_cache("Users")
-                                st.success(f"✅ Added Auditor {new_name.strip()} ({new_email.strip().lower()}) with read-only oversight (no leave/tour balance) and private channel: {new_topic}")
-                                st.rerun()
-                            else:
-                                new_sm_row = pd.DataFrame([{
-                                    "Name": new_name.strip(),
-                                    "Post": new_post.strip(),
-                                    "JoiningDate": new_join.strftime("%Y-%m-%d"),
-                                    "Service Year": 0.0, "Service Year Penalty": 0.0, "Actual Service Year": 0.0,
-                                    "Opening_CL": new_o_cl, "Addition_CL": new_a_cl, "Penalty_CL(UL Effect)": new_p_cl, "Used_CL": new_u_cl, "Balance_CL": init_bal_cl,
-                                    "Opening_SL": new_o_sl, "Addition_SL": new_a_sl, "Penalty_SL(UL Effect)": new_p_sl, "Used_SL": new_u_sl, "Balance_SL": init_bal_sl,
-                                    "Opening_AL": new_o_al, "Addition_AL": new_a_al, "Penalty_AL(UL Effect)": new_p_al, "Used_AL": new_u_al, "Encashed_AL": new_e_al, "Balance_AL": init_bal_al,
-                                    "Opening_UL": new_o_ul, "Addition_UL": new_a_ul, "Used_UL": new_u_ul, "Balance_UL": init_bal_ul,
-                                    "Cumulative_UL": new_cum_ul, "Last_UL_Milestone": float(new_ms_ul),
-                                    "Current Year Leave affecting Service Year": new_cur_eff,
-                                    "Cummulative leave effecting Service year.(Education Leave & Etc).": new_cum_eff,
-                                    "Branch": new_branch,
-                                    "Active_FY": str(new_active_fy).strip() or get_current_financial_year_dates()[2]
-                                }])
-
-                                merged_sm = pd.concat([staff_df, new_sm_row], ignore_index=True)
-                                _gsheets_retry(conn.update, worksheet="Staff_Master", data=inject_balance_formulas(merged_sm))
-                                _invalidate_sheet_cache("Users", "Staff_Master")
-                                st.success(f"✅ Added {new_name} ({new_role}) with full leave ledger and private channel: {new_topic}")
-                                st.rerun()
+                            merged_sm = pd.concat([staff_df, new_sm_row], ignore_index=True)
+                            _gsheets_retry(conn.update, worksheet="Staff_Master", data=inject_balance_formulas(merged_sm))
+                            _invalidate_sheet_cache("Users", "Staff_Master")
+                            st.success(f"✅ Added {new_name} ({new_role}) with full leave ledger and private channel: {new_topic}")
+                            st.rerun()
 
         # Section B: Edit Existing Staff (Profile + All 32 Staff_Master Columns for Central Admin & Central Account)
         st.markdown("#### ✏️ Edit Staff Profile, PIN & Complete Leave Ledger (`Users` + `Staff_Master`)")
@@ -7201,92 +7299,51 @@ def render_system_settings(is_admin=True):
             elif is_central_viewer and sm_idx is not None:
                 st.markdown("##### 2. Complete `Staff_Master` Leave & Service Year Fields (Simplified Category Cards + `?` Formulas)")
                 st.caption(
-                    "Each category card below displays its **Live Mathematical Formula** and has a **`(?)` tooltip icon** on every field. "
-                    "If you edit `Opening_*`, `Addition_*`, `Penalty_*`, `Used_*`, or `Encashed_AL`, the corresponding `Balance_*` updates automatically; "
-                    "if you directly edit `Balance_*`, `Opening_*` adjusts automatically so your typed balance is saved."
+                    "Only **🟨 Manual Input** columns are editable below. All **🔒 Locked Formula** columns (`Service Year`, `Service Year Penalty`, `Actual Service Year`, `Penalty_*`, `Balance_*`, `Addition_UL`, `Last_UL_Milestone`) calculate live automatically as you type."
                 )
-
-                cur_svc_yr = float(_safe_num(sm_row.get("Service Year", 0.0)))
-                cur_svc_pen = float(_safe_num(sm_row.get("Service Year Penalty", 0.0)))
-                cur_act_svc = float(_safe_num(sm_row.get("Actual Service Year", 0.0)))
 
                 orig_o_cl = float(_safe_num(sm_row.get("Opening_CL", 0.0)))
                 orig_a_cl = float(_safe_num(sm_row.get("Addition_CL", 0.0)))
-                orig_p_cl = float(_safe_num(sm_row.get("Penalty_CL(UL Effect)", 0.0)))
                 orig_u_cl = float(_safe_num(sm_row.get("Used_CL", 0.0)))
-                orig_b_cl = float(_safe_num(sm_row.get("Balance_CL", 0.0)))
 
                 orig_o_sl = float(_safe_num(sm_row.get("Opening_SL", 0.0)))
                 orig_a_sl = float(_safe_num(sm_row.get("Addition_SL", 0.0)))
-                orig_p_sl = float(_safe_num(sm_row.get("Penalty_SL(UL Effect)", 0.0)))
                 orig_u_sl = float(_safe_num(sm_row.get("Used_SL", 0.0)))
-                orig_b_sl = float(_safe_num(sm_row.get("Balance_SL", 0.0)))
 
                 orig_o_al = float(_safe_num(sm_row.get("Opening_AL", 0.0)))
                 orig_a_al = float(_safe_num(sm_row.get("Addition_AL", 0.0)))
-                orig_p_al = float(_safe_num(sm_row.get("Penalty_AL(UL Effect)", 0.0)))
                 orig_u_al = float(_safe_num(sm_row.get("Used_AL", 0.0)))
                 orig_e_al = float(_safe_num(sm_row.get("Encashed_AL", 0.0)))
-                orig_b_al = float(_safe_num(sm_row.get("Balance_AL", 0.0)))
 
                 orig_o_ul = float(_safe_num(sm_row.get("Opening_UL", 0.0)))
-                orig_a_ul = float(_safe_num(sm_row.get("Addition_UL", 0.0)))
                 orig_u_ul = float(_safe_num(sm_row.get("Used_UL", 0.0)))
-                orig_b_ul = float(_safe_num(sm_row.get("Balance_UL", 0.0)))
                 orig_cum_ul = float(_safe_num(sm_row.get("Cumulative_UL", 0.0)))
-                orig_ms_ul = float(_safe_num(sm_row.get("Last_UL_Milestone", 0.0)))
 
                 orig_cur_eff = float(_safe_num(sm_row.get("Current Year Leave affecting Service Year", 0.0)))
                 orig_cum_eff = float(_safe_num(sm_row.get("Cummulative leave effecting Service year.(Education Leave & Etc).", 0.0)))
 
-                # Card 2A: Service Tenure & Penalty (Locked Service Year & Actual Service Year; Smart Y/M/D Penalty Editor)
+                cl_pr_ed = float(lt_rules_u.get("CL", {}).get("Pro_Rata_UL_Penalty", 0.75))
+                sl_pr_ed = float(lt_rules_u.get("SL", {}).get("Pro_Rata_UL_Penalty", 2.50))
+                al_pr_ed = float(lt_rules_u.get("AL", {}).get("Pro_Rata_UL_Penalty", 2.50))
+                al_cap_disp = float(lt_rules_u.get("AL", {}).get("Max_Accumulation_Cap", 180.0))
+                ul_cap_disp = float(gl_rules_u.get("UL_Career_Max_Cap", 730.0))
+
+                # Read live Yellow UL & Service-Affecting inputs from session_state so Tenure & Pro-Rata Penalties update immediately
+                cur_ed_o_ul = float(st.session_state.get(f"ed_oul_{e_user}", orig_o_ul))
+                cur_ed_u_ul = float(st.session_state.get(f"ed_uul_{e_user}", orig_u_ul))
+                cur_ed_cum_ul = float(st.session_state.get(f"ed_cumul_{e_user}", orig_cum_ul))
+                cur_ed_cur_eff = float(st.session_state.get(f"ed_cureff_{e_user}", orig_cur_eff))
+                cur_ed_cum_eff = float(st.session_state.get(f"ed_cumeff_{e_user}", orig_cum_eff))
+
+                # Card 2A: Service Tenure & Penalty (All 3 Locked Formula Columns: Service Year, Service Year Penalty, Actual Service Year)
                 live_cal_days = max(0, (get_cta_today() - edit_join).days)
                 live_svc_yr = round(live_cal_days / 365.25, 2)
+                ed_svc_pen = max(0.0, cur_ed_cum_ul + cur_ed_u_ul + cur_ed_cur_eff + cur_ed_cum_eff)
+                pen_years_equiv = ed_svc_pen / 365.25
+                live_act_svc = round(max(0.0, (float(live_cal_days) - ed_svc_pen) / 365.25), 2)
 
-                peny_key = f"ed_peny_{e_user}"
-                penm_key = f"ed_penm_{e_user}"
-                pend_key = f"ed_pend_{e_user}"
-                if peny_key not in st.session_state or penm_key not in st.session_state or pend_key not in st.session_state:
-                    init_tot_pen = max(0.0, float(cur_svc_pen))
-                    init_py = int(init_tot_pen // 365.0)
-                    rem_pen = init_tot_pen - (init_py * 365.0)
-                    init_pm = int(rem_pen // 30.0)
-                    init_pd = round((rem_pen - (init_pm * 30.0)) * 2.0) / 2.0
-                    if init_pm >= 12:
-                        init_py += init_pm // 12
-                        init_pm = init_pm % 12
-                    st.session_state[peny_key] = init_py
-                    st.session_state[penm_key] = init_pm
-                    st.session_state[pend_key] = float(init_pd)
-
-                def _normalize_svc_penalty_ymd(yk=peny_key, mk=penm_key, dk=pend_key):
-                    yv = max(0, int(st.session_state.get(yk, 0) or 0))
-                    mv = max(0, int(st.session_state.get(mk, 0) or 0))
-                    dv = max(0.0, float(st.session_state.get(dk, 0.0) or 0.0))
-                    # 1. Roll 365+ days directly into years
-                    add_y_from_d = int(dv // 365.0)
-                    rem_d = dv - (add_y_from_d * 365.0)
-                    # 2. Roll 30+ remaining days into months
-                    add_m_from_d = int(rem_d // 30.0)
-                    nd = round((rem_d - (add_m_from_d * 30.0)) * 2.0) / 2.0
-                    # 3. Roll 12+ months into years
-                    tot_m = mv + add_m_from_d
-                    add_y_from_m = int(tot_m // 12)
-                    nm = int(tot_m % 12)
-                    ny = int(yv + add_y_from_d + add_y_from_m)
-                    st.session_state[yk] = ny
-                    st.session_state[mk] = nm
-                    st.session_state[dk] = float(nd)
-
-                cur_pen_y = int(st.session_state.get(peny_key, 0) or 0)
-                cur_pen_m = int(st.session_state.get(penm_key, 0) or 0)
-                cur_pen_d = float(st.session_state.get(pend_key, 0.0) or 0.0)
-                ed_svc_pen = max(0.0, (cur_pen_y * 365.0) + (cur_pen_m * 30.0) + cur_pen_d)
-                pen_years_equiv = float(cur_pen_y) + (float(cur_pen_m) / 12.0) + (float(cur_pen_d) / 365.0)
-                live_act_svc = round(max(0.0, float(live_svc_yr) - pen_years_equiv), 2)
-
-                # Force locked number_inputs to reflect live calculated values on every rerun
                 st.session_state[f"ed_svcyr_{e_user}"] = float(live_svc_yr)
+                st.session_state[f"ed_svcpen_{e_user}"] = float(ed_svc_pen)
                 st.session_state[f"ed_actsvc_{e_user}"] = float(live_act_svc)
 
                 with st.container(border=True):
@@ -7294,11 +7351,7 @@ def render_system_settings(is_admin=True):
                         f"###### ⏳ Service Tenure & Penalty — "
                         f"`Actual Service Year ({live_act_svc:.2f}y) = Service Year ({live_svc_yr:.2f}y) - Penalty ({pen_years_equiv:.2f}y / {ed_svc_pen:g}d)`"
                     )
-                    st.caption(
-                        "🔒 **Service Year** and **Actual Service Year** are locked (auto-calculated from `JoiningDate` to Today). "
-                        "Enter **Service Penalty** in **Years, Months, or Days** and click **🔄 Convert** (or press Enter) — `365 days → 1 Year`, `30 days → 1 Month`, `12 months → 1 Year`."
-                    )
-                    c_sv1, c_py, c_pm, c_pd, c_conv, c_sv3 = st.columns([1.2, 0.9, 0.9, 1.0, 0.9, 1.2])
+                    c_sv1, c_sv2, c_sv3 = st.columns(3)
                     ed_svc_yr = c_sv1.number_input(
                         "Service Year 🔒",
                         step=0.01,
@@ -7307,40 +7360,13 @@ def render_system_settings(is_admin=True):
                         key=f"ed_svcyr_{e_user}",
                         disabled=True,
                     )
-                    c_py.number_input(
-                        "Penalty (Years)",
-                        min_value=0,
-                        step=1,
-                        key=peny_key,
-                        on_change=_normalize_svc_penalty_ymd,
-                        help="Penalty years (1 Year = 365 days).",
-                    )
-                    c_pm.number_input(
-                        "Penalty (Months)",
-                        min_value=0,
-                        step=1,
-                        key=penm_key,
-                        on_change=_normalize_svc_penalty_ymd,
-                        help="Penalty months (12 months converts to 1 Year).",
-                    )
-                    c_pd.number_input(
-                        "Penalty (Days)",
-                        min_value=0.0,
+                    c_sv2.number_input(
+                        "Service Year Penalty 🔒",
                         step=0.5,
-                        format="%.1f",
-                        key=pend_key,
-                        on_change=_normalize_svc_penalty_ymd,
-                        help="Penalty days (365 days converts to 1 Year; 30 days converts to 1 Month).",
+                        help=STAFF_MASTER_FIELD_HELP["Service Year Penalty"],
+                        key=f"ed_svcpen_{e_user}",
+                        disabled=True,
                     )
-                    with c_conv:
-                        st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
-                        st.button(
-                            "🔄 Convert",
-                            key=f"btn_conv_pen_{e_user}",
-                            on_click=_normalize_svc_penalty_ymd,
-                            use_container_width=True,
-                            help="Convert 365+ Days into Years, 30+ Days into Months, and 12+ Months into Years",
-                        )
                     ed_act_svc = c_sv3.number_input(
                         "Actual Service Year 🔒",
                         step=0.01,
@@ -7349,199 +7375,100 @@ def render_system_settings(is_admin=True):
                         key=f"ed_actsvc_{e_user}",
                         disabled=True,
                     )
-                    st.caption(
-                        f"📊 **Total Service Penalty:** `{cur_pen_y} Year(s), {cur_pen_m} Month(s), {cur_pen_d:g} Day(s)` "
-                        f"= **`{ed_svc_pen:g} total days`** (`{pen_years_equiv:.2f} yr`) &nbsp;|&nbsp; "
-                        f"**Net Actual Service Year:** `{live_svc_yr:.2f}y - {pen_years_equiv:.2f}y =` **`{live_act_svc:.2f}y`**"
-                    )
+
+                tot_pr_ed = cur_ed_u_ul + cur_ed_cur_eff
+                ed_p_cl = round((tot_pr_ed / 30.0) * cl_pr_ed * 2.0) / 2.0 if tot_pr_ed > 0 else 0.0
+                ed_p_sl = round((tot_pr_ed / 30.0) * sl_pr_ed * 2.0) / 2.0 if tot_pr_ed > 0 else 0.0
+                ed_p_al = round((tot_pr_ed / 30.0) * al_pr_ed * 2.0) / 2.0 if tot_pr_ed > 0 else 0.0
 
                 # Card 2B: Casual Leave (CL)
                 with st.container(border=True):
+                    cur_eo_cl = float(st.session_state.get(f"ed_ocl_{e_user}", orig_o_cl))
+                    cur_ea_cl = float(st.session_state.get(f"ed_acl_{e_user}", orig_a_cl))
+                    cur_eu_cl = float(st.session_state.get(f"ed_ucl_{e_user}", orig_u_cl))
+                    ed_b_cl = max(0.0, cur_eo_cl + cur_ea_cl - ed_p_cl - cur_eu_cl)
+                    st.session_state[f"ed_pcl_{e_user}"] = float(ed_p_cl)
+                    st.session_state[f"ed_bcl_{e_user}"] = float(ed_b_cl)
                     st.markdown(
                         f"###### 🟦 Casual Leave (CL) — "
-                        f"`Formula: Balance_CL ({orig_b_cl:g}) = max(0, Opening ({orig_o_cl:g}) + Addition ({orig_a_cl:g}) - Penalty ({orig_p_cl:g}) - Used ({orig_u_cl:g}))`"
+                        f"`Formula: Balance_CL ({ed_b_cl:g}) = max(0, Opening ({cur_eo_cl:g}) + Addition ({cur_ea_cl:g}) - Penalty ({ed_p_cl:g}) - Used ({cur_eu_cl:g}))`"
                     )
                     c_cl_1, c_cl_2, c_cl_3, c_cl_4, c_cl_5 = st.columns(5)
-                    ed_o_cl = c_cl_1.number_input(
-                        "Opening_CL",
-                        value=orig_o_cl,
-                        step=0.5,
-                        help=STAFF_MASTER_FIELD_HELP["Opening_CL"],
-                        key=f"ed_ocl_{e_user}",
-                    )
-                    ed_a_cl = c_cl_2.number_input(
-                        "Addition_CL",
-                        value=orig_a_cl,
-                        step=0.5,
-                        help=STAFF_MASTER_FIELD_HELP["Addition_CL"],
-                        key=f"ed_acl_{e_user}",
-                    )
-                    ed_p_cl = c_cl_3.number_input(
-                        "Penalty_CL(UL Effect)",
-                        value=orig_p_cl,
-                        step=0.5,
-                        help=STAFF_MASTER_FIELD_HELP["Penalty_CL(UL Effect)"],
-                        key=f"ed_pcl_{e_user}",
-                    )
-                    ed_u_cl = c_cl_4.number_input(
-                        "Used_CL",
-                        value=orig_u_cl,
-                        step=0.5,
-                        help=STAFF_MASTER_FIELD_HELP["Used_CL"],
-                        key=f"ed_ucl_{e_user}",
-                    )
-                    ed_b_cl = c_cl_5.number_input(
-                        "Balance_CL",
-                        value=orig_b_cl,
-                        step=0.5,
-                        help=STAFF_MASTER_FIELD_HELP["Balance_CL"],
-                        key=f"ed_bcl_{e_user}",
-                    )
+                    ed_o_cl = c_cl_1.number_input("Opening_CL", value=orig_o_cl, step=0.5, help=STAFF_MASTER_FIELD_HELP["Opening_CL"], key=f"ed_ocl_{e_user}")
+                    ed_a_cl = c_cl_2.number_input("Addition_CL", value=orig_a_cl, step=0.5, help=STAFF_MASTER_FIELD_HELP["Addition_CL"], key=f"ed_acl_{e_user}")
+                    c_cl_3.number_input("Penalty_CL(UL Effect) 🔒", step=0.5, help=STAFF_MASTER_FIELD_HELP["Penalty_CL(UL Effect)"], key=f"ed_pcl_{e_user}", disabled=True)
+                    ed_u_cl = c_cl_4.number_input("Used_CL", value=orig_u_cl, step=0.5, help=STAFF_MASTER_FIELD_HELP["Used_CL"], key=f"ed_ucl_{e_user}")
+                    c_cl_5.number_input("Balance_CL 🔒", step=0.5, help=STAFF_MASTER_FIELD_HELP["Balance_CL"], key=f"ed_bcl_{e_user}", disabled=True)
 
                 # Card 2C: Sick Leave (SL)
                 with st.container(border=True):
+                    cur_eo_sl = float(st.session_state.get(f"ed_osl_{e_user}", orig_o_sl))
+                    cur_ea_sl = float(st.session_state.get(f"ed_asl_{e_user}", orig_a_sl))
+                    cur_eu_sl = float(st.session_state.get(f"ed_usl_{e_user}", orig_u_sl))
+                    ed_b_sl = max(0.0, cur_eo_sl + cur_ea_sl - ed_p_sl - cur_eu_sl)
+                    st.session_state[f"ed_psl_{e_user}"] = float(ed_p_sl)
+                    st.session_state[f"ed_bsl_{e_user}"] = float(ed_b_sl)
                     st.markdown(
                         f"###### 🟩 Sick Leave (SL) — "
-                        f"`Formula: Balance_SL ({orig_b_sl:g}) = max(0, Opening ({orig_o_sl:g}) + Addition ({orig_a_sl:g}) - Penalty ({orig_p_sl:g}) - Used ({orig_u_sl:g}))`"
+                        f"`Formula: Balance_SL ({ed_b_sl:g}) = max(0, Opening ({cur_eo_sl:g}) + Addition ({cur_ea_sl:g}) - Penalty ({ed_p_sl:g}) - Used ({cur_eu_sl:g}))`"
                     )
                     c_sl_1, c_sl_2, c_sl_3, c_sl_4, c_sl_5 = st.columns(5)
-                    ed_o_sl = c_sl_1.number_input(
-                        "Opening_SL",
-                        value=orig_o_sl,
-                        step=0.5,
-                        help=STAFF_MASTER_FIELD_HELP["Opening_SL"],
-                        key=f"ed_osl_{e_user}",
-                    )
-                    ed_a_sl = c_sl_2.number_input(
-                        "Addition_SL",
-                        value=orig_a_sl,
-                        step=0.5,
-                        help=STAFF_MASTER_FIELD_HELP["Addition_SL"],
-                        key=f"ed_asl_{e_user}",
-                    )
-                    ed_p_sl = c_sl_3.number_input(
-                        "Penalty_SL(UL Effect)",
-                        value=orig_p_sl,
-                        step=0.5,
-                        help=STAFF_MASTER_FIELD_HELP["Penalty_SL(UL Effect)"],
-                        key=f"ed_psl_{e_user}",
-                    )
-                    ed_u_sl = c_sl_4.number_input(
-                        "Used_SL",
-                        value=orig_u_sl,
-                        step=0.5,
-                        help=STAFF_MASTER_FIELD_HELP["Used_SL"],
-                        key=f"ed_usl_{e_user}",
-                    )
-                    ed_b_sl = c_sl_5.number_input(
-                        "Balance_SL",
-                        value=orig_b_sl,
-                        step=0.5,
-                        help=STAFF_MASTER_FIELD_HELP["Balance_SL"],
-                        key=f"ed_bsl_{e_user}",
-                    )
+                    ed_o_sl = c_sl_1.number_input("Opening_SL", value=orig_o_sl, step=0.5, help=STAFF_MASTER_FIELD_HELP["Opening_SL"], key=f"ed_osl_{e_user}")
+                    ed_a_sl = c_sl_2.number_input("Addition_SL", value=orig_a_sl, step=0.5, help=STAFF_MASTER_FIELD_HELP["Addition_SL"], key=f"ed_asl_{e_user}")
+                    c_sl_3.number_input("Penalty_SL(UL Effect) 🔒", step=0.5, help=STAFF_MASTER_FIELD_HELP["Penalty_SL(UL Effect)"], key=f"ed_psl_{e_user}", disabled=True)
+                    ed_u_sl = c_sl_4.number_input("Used_SL", value=orig_u_sl, step=0.5, help=STAFF_MASTER_FIELD_HELP["Used_SL"], key=f"ed_usl_{e_user}")
+                    c_sl_5.number_input("Balance_SL 🔒", step=0.5, help=STAFF_MASTER_FIELD_HELP["Balance_SL"], key=f"ed_bsl_{e_user}", disabled=True)
 
                 # Card 2D: Annual Leave (AL)
                 with st.container(border=True):
-                    al_cap_disp = float(lt_rules_u.get("AL", {}).get("Max_Accumulation_Cap", 180.0))
+                    cur_eo_al = float(st.session_state.get(f"ed_oal_{e_user}", orig_o_al))
+                    cur_ea_al = float(st.session_state.get(f"ed_aal_{e_user}", orig_a_al))
+                    cur_eu_al = float(st.session_state.get(f"ed_ual_{e_user}", orig_u_al))
+                    cur_ee_al = float(st.session_state.get(f"ed_eal_{e_user}", orig_e_al))
+                    raw_eb_al = max(0.0, cur_eo_al + cur_ea_al - ed_p_al - cur_eu_al - cur_ee_al)
+                    ed_b_al = min(al_cap_disp, raw_eb_al) if al_cap_disp > 0 else raw_eb_al
+                    st.session_state[f"ed_pal_{e_user}"] = float(ed_p_al)
+                    st.session_state[f"ed_bal_{e_user}"] = float(ed_b_al)
                     st.markdown(
                         f"###### 🟨 Annual Leave (AL) — "
-                        f"`Formula: Balance_AL ({orig_b_al:g}) = min({al_cap_disp:g}, max(0, Opening ({orig_o_al:g}) + Addition ({orig_a_al:g}) - Penalty ({orig_p_al:g}) - Used ({orig_u_al:g}) - Encashed ({orig_e_al:g})))`"
+                        f"`Formula: Balance_AL ({ed_b_al:g}) = min({al_cap_disp:g}, max(0, Opening ({cur_eo_al:g}) + Addition ({cur_ea_al:g}) - Penalty ({ed_p_al:g}) - Used ({cur_eu_al:g}) - Encashed ({cur_ee_al:g})))`"
                     )
                     c_al_1, c_al_2, c_al_3, c_al_4, c_al_5, c_al_6 = st.columns(6)
-                    ed_o_al = c_al_1.number_input(
-                        "Opening_AL",
-                        value=orig_o_al,
-                        step=0.5,
-                        help=STAFF_MASTER_FIELD_HELP["Opening_AL"],
-                        key=f"ed_oal_{e_user}",
-                    )
-                    ed_a_al = c_al_2.number_input(
-                        "Addition_AL",
-                        value=orig_a_al,
-                        step=0.5,
-                        help=STAFF_MASTER_FIELD_HELP["Addition_AL"],
-                        key=f"ed_aal_{e_user}",
-                    )
-                    ed_p_al = c_al_3.number_input(
-                        "Penalty_AL(UL Effect)",
-                        value=orig_p_al,
-                        step=0.5,
-                        help=STAFF_MASTER_FIELD_HELP["Penalty_AL(UL Effect)"],
-                        key=f"ed_pal_{e_user}",
-                    )
-                    ed_u_al = c_al_4.number_input(
-                        "Used_AL",
-                        value=orig_u_al,
-                        step=0.5,
-                        help=STAFF_MASTER_FIELD_HELP["Used_AL"],
-                        key=f"ed_ual_{e_user}",
-                    )
-                    ed_e_al = c_al_5.number_input(
-                        "Encashed_AL",
-                        value=orig_e_al,
-                        step=0.5,
-                        help=STAFF_MASTER_FIELD_HELP["Encashed_AL"],
-                        key=f"ed_eal_{e_user}",
-                    )
-                    ed_b_al = c_al_6.number_input(
-                        "Balance_AL",
-                        value=orig_b_al,
-                        step=0.5,
-                        help=STAFF_MASTER_FIELD_HELP["Balance_AL"],
-                        key=f"ed_bal_{e_user}",
-                    )
+                    ed_o_al = c_al_1.number_input("Opening_AL", value=orig_o_al, step=0.5, help=STAFF_MASTER_FIELD_HELP["Opening_AL"], key=f"ed_oal_{e_user}")
+                    ed_a_al = c_al_2.number_input("Addition_AL", value=orig_a_al, step=0.5, help=STAFF_MASTER_FIELD_HELP["Addition_AL"], key=f"ed_aal_{e_user}")
+                    c_al_3.number_input("Penalty_AL(UL Effect) 🔒", step=0.5, help=STAFF_MASTER_FIELD_HELP["Penalty_AL(UL Effect)"], key=f"ed_pal_{e_user}", disabled=True)
+                    ed_u_al = c_al_4.number_input("Used_AL", value=orig_u_al, step=0.5, help=STAFF_MASTER_FIELD_HELP["Used_AL"], key=f"ed_ual_{e_user}")
+                    ed_e_al = c_al_5.number_input("Encashed_AL", value=orig_e_al, step=0.5, help=STAFF_MASTER_FIELD_HELP["Encashed_AL"], key=f"ed_eal_{e_user}")
+                    c_al_6.number_input("Balance_AL 🔒", step=0.5, help=STAFF_MASTER_FIELD_HELP["Balance_AL"], key=f"ed_bal_{e_user}", disabled=True)
 
                 # Card 2E: Unpaid Leave (UL) & Service-Affecting Leave
                 with st.container(border=True):
-                    ul_cap_disp = float(gl_rules_u.get("UL_Career_Max_Cap", 730.0))
+                    ed_ms_ul = float(min(20, int(live_act_svc // 5) * 5))
+                    ed_ul_pool = cur_ed_o_ul + cur_ed_cum_ul
+                    if (
+                        (ed_ms_ul == 5.0 and ed_ul_pool < 182.5)
+                        or (ed_ms_ul == 10.0 and ed_ul_pool < 365.0)
+                        or (ed_ms_ul == 15.0 and ed_ul_pool < 547.5)
+                        or (ed_ms_ul >= 20.0 and ed_ul_pool < 730.0)
+                    ):
+                        ed_a_ul = 182.5
+                    else:
+                        ed_a_ul = 0.0
+                    ed_b_ul = max(0.0, cur_ed_o_ul + ed_a_ul - cur_ed_u_ul)
+                    st.session_state[f"ed_aul_{e_user}"] = float(ed_a_ul)
+                    st.session_state[f"ed_bul_{e_user}"] = float(ed_b_ul)
+                    st.session_state[f"ed_msul_{e_user}"] = float(ed_ms_ul)
                     st.markdown(
                         f"###### 🟪 Unpaid Leave (UL) & Service-Affecting Leave — "
-                        f"`Formula: Balance_UL ({orig_b_ul:g}) = max(0, Opening ({orig_o_ul:g}) + Addition ({orig_a_ul:g}) - Used ({orig_u_ul:g})) | Career Cap ≤ {ul_cap_disp:g}d`"
+                        f"`Formula: Balance_UL ({ed_b_ul:g}) = max(0, Opening ({cur_ed_o_ul:g}) + Addition ({ed_a_ul:g}) - Used ({cur_ed_u_ul:g})) | Career Cap ≤ {ul_cap_disp:g}d`"
                     )
                     c_ul_1, c_ul_2, c_ul_3, c_ul_4, c_ul_5, c_ul_6 = st.columns(6)
-                    ed_o_ul = c_ul_1.number_input(
-                        "Opening_UL",
-                        value=orig_o_ul,
-                        step=0.5,
-                        help=STAFF_MASTER_FIELD_HELP["Opening_UL"],
-                        key=f"ed_oul_{e_user}",
-                    )
-                    ed_a_ul = c_ul_2.number_input(
-                        "Addition_UL",
-                        value=orig_a_ul,
-                        step=0.5,
-                        help=STAFF_MASTER_FIELD_HELP["Addition_UL"],
-                        key=f"ed_aul_{e_user}",
-                    )
-                    ed_u_ul = c_ul_3.number_input(
-                        "Used_UL",
-                        value=orig_u_ul,
-                        step=0.5,
-                        help=STAFF_MASTER_FIELD_HELP["Used_UL"],
-                        key=f"ed_uul_{e_user}",
-                    )
-                    ed_b_ul = c_ul_4.number_input(
-                        "Balance_UL",
-                        value=orig_b_ul,
-                        step=0.5,
-                        help=STAFF_MASTER_FIELD_HELP["Balance_UL"],
-                        key=f"ed_bul_{e_user}",
-                    )
-                    ed_cum_ul = c_ul_5.number_input(
-                        "Cumulative_UL",
-                        value=orig_cum_ul,
-                        step=0.5,
-                        help=STAFF_MASTER_FIELD_HELP["Cumulative_UL"],
-                        key=f"ed_cumul_{e_user}",
-                    )
-                    ed_ms_ul = c_ul_6.number_input(
-                        "Last_UL_Milestone",
-                        value=orig_ms_ul,
-                        step=5.0,
-                        help=STAFF_MASTER_FIELD_HELP["Last_UL_Milestone"],
-                        key=f"ed_msul_{e_user}",
-                    )
+                    ed_o_ul = c_ul_1.number_input("Opening_UL", value=orig_o_ul, step=0.5, help=STAFF_MASTER_FIELD_HELP["Opening_UL"], key=f"ed_oul_{e_user}")
+                    c_ul_2.number_input("Addition_UL 🔒", step=0.5, help=STAFF_MASTER_FIELD_HELP["Addition_UL"], key=f"ed_aul_{e_user}", disabled=True)
+                    ed_u_ul = c_ul_3.number_input("Used_UL", value=orig_u_ul, step=0.5, help=STAFF_MASTER_FIELD_HELP["Used_UL"], key=f"ed_uul_{e_user}")
+                    c_ul_4.number_input("Balance_UL 🔒", step=0.5, help=STAFF_MASTER_FIELD_HELP["Balance_UL"], key=f"ed_bul_{e_user}", disabled=True)
+                    ed_cum_ul = c_ul_5.number_input("Cumulative_UL", value=orig_cum_ul, step=0.5, help=STAFF_MASTER_FIELD_HELP["Cumulative_UL"], key=f"ed_cumul_{e_user}")
+                    c_ul_6.number_input("Last_UL_Milestone 🔒", step=5.0, help=STAFF_MASTER_FIELD_HELP["Last_UL_Milestone"], key=f"ed_msul_{e_user}", disabled=True)
 
                     c_sef1, c_sef2 = st.columns(2)
                     ed_cur_eff = c_sef1.number_input(
@@ -7589,53 +7516,38 @@ def render_system_settings(is_admin=True):
                         if is_central_viewer:
                             staff_df.at[sm_idx, "Active_FY"] = str(edit_active_fy).strip() or get_current_financial_year_dates()[2]
 
-                            # If Balance_* was edited directly while its component fields stayed untouched, adjust Opening_* so the direct Balance_* edit persists
-                            final_o_cl = ed_o_cl + (ed_b_cl - orig_b_cl) if (abs(ed_b_cl - orig_b_cl) > 1e-6 and abs(ed_o_cl - orig_o_cl) < 1e-6 and abs(ed_a_cl - orig_a_cl) < 1e-6 and abs(ed_p_cl - orig_p_cl) < 1e-6 and abs(ed_u_cl - orig_u_cl) < 1e-6) else ed_o_cl
-                            final_o_sl = ed_o_sl + (ed_b_sl - orig_b_sl) if (abs(ed_b_sl - orig_b_sl) > 1e-6 and abs(ed_o_sl - orig_o_sl) < 1e-6 and abs(ed_a_sl - orig_a_sl) < 1e-6 and abs(ed_p_sl - orig_p_sl) < 1e-6 and abs(ed_u_sl - orig_u_sl) < 1e-6) else ed_o_sl
-                            final_o_al = ed_o_al + (ed_b_al - orig_b_al) if (abs(ed_b_al - orig_b_al) > 1e-6 and abs(ed_o_al - orig_o_al) < 1e-6 and abs(ed_a_al - orig_a_al) < 1e-6 and abs(ed_p_al - orig_p_al) < 1e-6 and abs(ed_u_al - orig_u_al) < 1e-6 and abs(ed_e_al - orig_e_al) < 1e-6) else ed_o_al
-                            final_o_ul = ed_o_ul + (ed_b_ul - orig_b_ul) if (abs(ed_b_ul - orig_b_ul) > 1e-6 and abs(ed_o_ul - orig_o_ul) < 1e-6 and abs(ed_a_ul - orig_a_ul) < 1e-6 and abs(ed_u_ul - orig_u_ul) < 1e-6) else ed_o_ul
-
-                            staff_df.at[sm_idx, "Opening_CL"] = final_o_cl
+                            staff_df.at[sm_idx, "Opening_CL"] = ed_o_cl
                             staff_df.at[sm_idx, "Addition_CL"] = ed_a_cl
                             staff_df.at[sm_idx, "Penalty_CL(UL Effect)"] = ed_p_cl
                             staff_df.at[sm_idx, "Used_CL"] = ed_u_cl
+                            staff_df.at[sm_idx, "Balance_CL"] = ed_b_cl
 
-                            staff_df.at[sm_idx, "Opening_SL"] = final_o_sl
+                            staff_df.at[sm_idx, "Opening_SL"] = ed_o_sl
                             staff_df.at[sm_idx, "Addition_SL"] = ed_a_sl
                             staff_df.at[sm_idx, "Penalty_SL(UL Effect)"] = ed_p_sl
                             staff_df.at[sm_idx, "Used_SL"] = ed_u_sl
+                            staff_df.at[sm_idx, "Balance_SL"] = ed_b_sl
 
-                            staff_df.at[sm_idx, "Opening_AL"] = final_o_al
+                            staff_df.at[sm_idx, "Opening_AL"] = ed_o_al
                             staff_df.at[sm_idx, "Addition_AL"] = ed_a_al
                             staff_df.at[sm_idx, "Penalty_AL(UL Effect)"] = ed_p_al
                             staff_df.at[sm_idx, "Used_AL"] = ed_u_al
                             staff_df.at[sm_idx, "Encashed_AL"] = ed_e_al
+                            staff_df.at[sm_idx, "Balance_AL"] = ed_b_al
 
-                            staff_df.at[sm_idx, "Opening_UL"] = final_o_ul
+                            staff_df.at[sm_idx, "Opening_UL"] = ed_o_ul
                             staff_df.at[sm_idx, "Addition_UL"] = ed_a_ul
                             staff_df.at[sm_idx, "Used_UL"] = ed_u_ul
+                            staff_df.at[sm_idx, "Balance_UL"] = ed_b_ul
                             staff_df.at[sm_idx, "Cumulative_UL"] = ed_cum_ul
                             staff_df.at[sm_idx, "Last_UL_Milestone"] = ed_ms_ul
                             staff_df.at[sm_idx, "Current Year Leave affecting Service Year"] = ed_cur_eff
-                            # If Service Year Penalty was edited via the Y/M/D penalty inputs while component fields stayed untouched, sync cumulative service-affecting days so live tenure reflects the penalty
-                            pen_components_untouched = (
-                                abs(ed_u_ul - orig_u_ul) < 1e-6
-                                and abs(ed_cum_ul - orig_cum_ul) < 1e-6
-                                and abs(ed_cur_eff - orig_cur_eff) < 1e-6
-                                and abs(ed_cum_eff - orig_cum_eff) < 1e-6
-                            )
-                            if abs(ed_svc_pen - cur_svc_pen) > 1e-6 and pen_components_untouched:
-                                final_cum_eff = max(0.0, orig_cum_eff + (ed_svc_pen - cur_svc_pen))
-                            else:
-                                final_cum_eff = ed_cum_eff
-                            staff_df.at[sm_idx, "Cummulative leave effecting Service year.(Education Leave & Etc)."] = final_cum_eff
+                            staff_df.at[sm_idx, "Cummulative leave effecting Service year.(Education Leave & Etc)."] = ed_cum_eff
+                            staff_df.at[sm_idx, "Service Year"] = live_svc_yr
                             staff_df.at[sm_idx, "Service Year Penalty"] = ed_svc_pen
+                            staff_df.at[sm_idx, "Actual Service Year"] = live_act_svc
 
                         synced_sm = inject_balance_formulas(staff_df)
-                        if is_central_viewer and abs(ed_svc_pen - cur_svc_pen) > 1e-6:
-                            synced_sm.at[sm_idx, "Service Year Penalty"] = ed_svc_pen
-                            synced_sm.at[sm_idx, "Actual Service Year"] = live_act_svc
-
                         _gsheets_retry(conn.update, worksheet="Staff_Master", data=synced_sm)
 
                     _invalidate_sheet_cache("Users", "Staff_Master")
@@ -8721,101 +8633,14 @@ def branch_manager_dashboard():
                 bml_e = bml_s + bm_lv_per_page
 
                 for _, row in branch_hist_leaves.iloc[bml_s:bml_e].iterrows():
-                    is_bm_h_act = _is_active_sheet_row(row)
                     row_st = str(row.get("Status", "")).strip()
-                    col1, col2, col3 = st.columns([3.5, 1.2, 1.5])
+                    col1, col2 = st.columns([5, 1])
                     st_suffix = "" if row_st == "Approved" else f" — Status: {row_st}"
                     col1.write(f"**{row['Name']}** — {row['LeaveType']}: **{row['TotalDays']} Day(s)** ({row['StartDate']} to {row['EndDate']}){st_suffix}")
                     if col2.button("📄 Preview", key=f"prev_bm_hist_{row['ID']}"):
                         pdf_bytes = generate_leave_pdf(row)
                         if pdf_bytes:
                             open_pdf_dialog(pdf_bytes, f"{row['Name']}_{row['StartDate']}_Leave.pdf")
-                    if row_st == "Approved":
-                        if col3.button(
-                            "❌ Cancel & Refund",
-                            key=f"canc_bm_hist_{row['ID']}",
-                            disabled=not is_bm_h_act,
-                            help="Cancel this approved leave and automatically restore days back to employee balance.",
-                        ):
-                            with st.spinner("Cancelling leave & refunding balance..."):
-                                act_m = df_requests[df_requests["ID"].map(_normalize_record_id) == _normalize_record_id(row["ID"])].index
-                                if not act_m.empty:
-                                    df_requests.loc[act_m, "Status"] = "Cancelled"
-                                    _gsheets_retry(conn.update, worksheet="LeaveRequests", data=df_requests)
-                                e_name = row["Name"]
-                                l_type = str(row["LeaveType"]).replace("Return-", "")
-                                l_days = float(row["TotalDays"]) if pd.notnull(row["TotalDays"]) else 0.0
-                                try:
-                                    l_start = _parse_cta_date(row["StartDate"]) or pd.to_datetime(row["StartDate"]).date()
-                                    l_end = _parse_cta_date(row["EndDate"]) or pd.to_datetime(row["EndDate"]).date()
-                                    bdown = get_leave_fy_breakdown(l_start, l_end, l_days)
-                                    cur_fy_s, _, _ = get_current_financial_year_dates()
-                                    if bdown:
-                                        cur_fy_days = float(bdown[cur_fy_s.year]["days"]) if cur_fy_s.year in bdown else 0.0
-                                        prior_fy_days = sum(float(v["days"]) for y, v in bdown.items() if y < cur_fy_s.year)
-                                    else:
-                                        cur_fy_days = l_days
-                                        prior_fy_days = 0.0
-                                except Exception:
-                                    cur_fy_days = l_days
-                                    prior_fy_days = 0.0
-
-                                if staff_df is not None:
-                                    e_idx = staff_df[staff_df["Name"] == e_name].index
-                                    if not e_idx.empty:
-                                        u_idx = e_idx[0]
-                                        if l_type in ["CL", "SL", "AL", "UL"]:
-                                            u_col = f"Used_{l_type}"
-                                            if u_col in staff_df.columns:
-                                                cur_used = float(staff_df.at[u_idx, u_col]) if pd.notnull(staff_df.at[u_idx, u_col]) else 0.0
-                                                refund_used = cur_fy_days if l_type == "UL" else l_days
-                                                staff_df.at[u_idx, u_col] = max(0.0, cur_used - refund_used)
-                                            b_col = f"Balance_{l_type}"
-                                            if b_col in staff_df.columns:
-                                                cur_bal = float(staff_df.at[u_idx, b_col]) if pd.notnull(staff_df.at[u_idx, b_col]) else 0.0
-                                                staff_df.at[u_idx, b_col] = max(0.0, cur_bal + (cur_fy_days if l_type == "UL" else l_days))
-                                            if l_type == "UL" and prior_fy_days != 0.0:
-                                                if "Cumulative_UL" in staff_df.columns:
-                                                    c_ul_val = float(staff_df.at[u_idx, "Cumulative_UL"]) if pd.notnull(staff_df.at[u_idx, "Cumulative_UL"]) else 0.0
-                                                    staff_df.at[u_idx, "Cumulative_UL"] = max(0.0, c_ul_val - prior_fy_days)
-                                                if "Opening_UL" in staff_df.columns:
-                                                    cur_open_ul = float(staff_df.at[u_idx, "Opening_UL"]) if pd.notnull(staff_df.at[u_idx, "Opening_UL"]) else 0.0
-                                                    staff_df.at[u_idx, "Opening_UL"] = max(0.0, cur_open_ul + prior_fy_days)
-                                                if b_col in staff_df.columns:
-                                                    staff_df.at[u_idx, b_col] = max(0.0, float(staff_df.at[u_idx, b_col]) + prior_fy_days)
-
-                                        if row.get("EffectsServiceYear") == "Yes":
-                                            c_col = "Current Year Leave affecting Service Year"
-                                            if c_col in staff_df.columns:
-                                                c_val = float(staff_df.at[u_idx, c_col]) if pd.notnull(staff_df.at[u_idx, c_col]) else 0.0
-                                                staff_df.at[u_idx, c_col] = max(0.0, c_val - cur_fy_days)
-                                            cum_eff_col = "Cummulative leave effecting Service year.(Education Leave & Etc)."
-                                            if prior_fy_days != 0.0 and cum_eff_col in staff_df.columns:
-                                                cur_eff_cum = float(staff_df.at[u_idx, cum_eff_col]) if pd.notnull(staff_df.at[u_idx, cum_eff_col]) else 0.0
-                                                staff_df.at[u_idx, cum_eff_col] = max(0.0, cur_eff_cum - prior_fy_days)
-
-                                        penalty_col = "Service Year Penalty"
-                                        if penalty_col in staff_df.columns:
-                                            def sf_bmc(val):
-                                                try: return float(val)
-                                                except: return 0.0
-                                            curr_eff = sf_bmc(staff_df.at[u_idx, "Current Year Leave affecting Service Year"]) if "Current Year Leave affecting Service Year" in staff_df.columns else 0.0
-                                            eff = sf_bmc(staff_df.at[u_idx, "Cummulative leave effecting Service year.(Education Leave & Etc)."]) if "Cummulative leave effecting Service year.(Education Leave & Etc)." in staff_df.columns else 0.0
-                                            u_ul = sf_bmc(staff_df.at[u_idx, "Used_UL"]) if "Used_UL" in staff_df.columns else 0.0
-                                            c_ul = sf_bmc(staff_df.at[u_idx, "Cumulative_UL"]) if "Cumulative_UL" in staff_df.columns else 0.0
-                                            staff_df.at[u_idx, penalty_col] = eff + curr_eff + u_ul + c_ul
-
-                                        _gsheets_retry(conn.update, worksheet="Staff_Master", data=inject_balance_formulas(staff_df))
-                                _invalidate_sheet_cache("LeaveRequests", "Staff_Master")
-                                emp_top = get_user_ntfy_topic(e_name)
-                                if emp_top:
-                                    send_ntfy_notification(
-                                        emp_top,
-                                        "Leave Cancelled & Balance Restored 🔄",
-                                        f"Branch Manager {bm_name} cancelled your {row['LeaveType']} request ({l_days} days). Your balance has been restored!"
-                                    )
-                                st.success(f"Cancelled leave #{row['ID']} for {e_name} and restored {l_days} day(s)!")
-                                st.rerun()
 
                 st.divider()
                 p_bml1, p_bml2, p_bml3 = st.columns([1, 2, 1])
@@ -9312,92 +9137,11 @@ def admin_dashboard():
             current_page_df = approved_requests.iloc[start_idx:end_idx]
             
             for idx, row in current_page_df.iterrows():
-                is_adm_app_act = _is_active_sheet_row(row)
-                col1, col2, col3 = st.columns([3.5, 1.2, 1.5])
+                col1, col2 = st.columns([5, 1])
                 col1.write(f"**{row['Name']}** — {row['LeaveType']}: **{row['TotalDays']} Day(s)** ({row['StartDate']} to {row['EndDate']})")
                 if col2.button("📄 Preview", key=f"prev_admin_{row['ID']}"):
                     pdf_bytes = generate_leave_pdf(row)
                     open_pdf_dialog(pdf_bytes, f"{row['Name']}_{row['StartDate']}_Leave.pdf")
-                if col3.button("❌ Cancel & Refund", key=f"canc_adm_{row['ID']}", disabled=not is_adm_app_act, help="Cancel this approved leave and automatically restore days back to employee balance."):
-                    with st.spinner("Cancelling leave & refunding balance..."):
-                        act_m = df_requests[df_requests["ID"].map(_normalize_record_id) == _normalize_record_id(row["ID"])].index
-                        if not act_m.empty:
-                            df_requests.loc[act_m, "Status"] = "Cancelled"
-                            _gsheets_retry(conn.update, worksheet="LeaveRequests", data=df_requests)
-                        e_name = row["Name"]
-                        l_type = row["LeaveType"].replace("Return-", "")
-                        l_days = float(row["TotalDays"]) if pd.notnull(row["TotalDays"]) else 0.0
-                        try:
-                            l_start = _parse_cta_date(row["StartDate"]) or pd.to_datetime(row["StartDate"]).date()
-                            l_end = _parse_cta_date(row["EndDate"]) or pd.to_datetime(row["EndDate"]).date()
-                            bdown = get_leave_fy_breakdown(l_start, l_end, l_days)
-                            cur_fy_s, _, _ = get_current_financial_year_dates()
-                            if bdown:
-                                cur_fy_days = float(bdown[cur_fy_s.year]["days"]) if cur_fy_s.year in bdown else 0.0
-                                prior_fy_days = sum(float(v["days"]) for y, v in bdown.items() if y < cur_fy_s.year)
-                            else:
-                                cur_fy_days = l_days
-                                prior_fy_days = 0.0
-                        except Exception:
-                            cur_fy_days = l_days
-                            prior_fy_days = 0.0
-
-                        if staff_df is not None:
-                            e_idx = staff_df[staff_df["Name"] == e_name].index
-                            if not e_idx.empty:
-                                u_idx = e_idx[0]
-                                if l_type in ["CL", "SL", "AL", "UL"]:
-                                    u_col = f"Used_{l_type}"
-                                    if u_col in staff_df.columns:
-                                        cur_used = float(staff_df.at[u_idx, u_col]) if pd.notnull(staff_df.at[u_idx, u_col]) else 0.0
-                                        refund_used = cur_fy_days if l_type == "UL" else l_days
-                                        staff_df.at[u_idx, u_col] = max(0.0, cur_used - refund_used)
-                                    b_col = f"Balance_{l_type}"
-                                    if b_col in staff_df.columns:
-                                        cur_bal = float(staff_df.at[u_idx, b_col]) if pd.notnull(staff_df.at[u_idx, b_col]) else 0.0
-                                        staff_df.at[u_idx, b_col] = max(0.0, cur_bal + (cur_fy_days if l_type == "UL" else l_days))
-                                    if l_type == "UL" and prior_fy_days != 0.0:
-                                        if "Cumulative_UL" in staff_df.columns:
-                                            c_ul_val = float(staff_df.at[u_idx, "Cumulative_UL"]) if pd.notnull(staff_df.at[u_idx, "Cumulative_UL"]) else 0.0
-                                            staff_df.at[u_idx, "Cumulative_UL"] = max(0.0, c_ul_val - prior_fy_days)
-                                        if "Opening_UL" in staff_df.columns:
-                                            cur_open_ul = float(staff_df.at[u_idx, "Opening_UL"]) if pd.notnull(staff_df.at[u_idx, "Opening_UL"]) else 0.0
-                                            staff_df.at[u_idx, "Opening_UL"] = max(0.0, cur_open_ul + prior_fy_days)
-                                        if b_col in staff_df.columns:
-                                            staff_df.at[u_idx, b_col] = max(0.0, float(staff_df.at[u_idx, b_col]) + prior_fy_days)
-
-                                if row.get("EffectsServiceYear") == "Yes":
-                                    c_col = "Current Year Leave affecting Service Year"
-                                    if c_col in staff_df.columns:
-                                        c_val = float(staff_df.at[u_idx, c_col]) if pd.notnull(staff_df.at[u_idx, c_col]) else 0.0
-                                        staff_df.at[u_idx, c_col] = max(0.0, c_val - cur_fy_days)
-                                    cum_eff_col = "Cummulative leave effecting Service year.(Education Leave & Etc)."
-                                    if prior_fy_days != 0.0 and cum_eff_col in staff_df.columns:
-                                        cur_eff_cum = float(staff_df.at[u_idx, cum_eff_col]) if pd.notnull(staff_df.at[u_idx, cum_eff_col]) else 0.0
-                                        staff_df.at[u_idx, cum_eff_col] = max(0.0, cur_eff_cum - prior_fy_days)
-
-                                penalty_col = "Service Year Penalty"
-                                if penalty_col in staff_df.columns:
-                                    def sf_c(val):
-                                        try: return float(val)
-                                        except: return 0.0
-                                    curr_eff = sf_c(staff_df.at[u_idx, "Current Year Leave affecting Service Year"]) if "Current Year Leave affecting Service Year" in staff_df.columns else 0.0
-                                    eff = sf_c(staff_df.at[u_idx, "Cummulative leave effecting Service year.(Education Leave & Etc)."]) if "Cummulative leave effecting Service year.(Education Leave & Etc)." in staff_df.columns else 0.0
-                                    u_ul = sf_c(staff_df.at[u_idx, "Used_UL"]) if "Used_UL" in staff_df.columns else 0.0
-                                    c_ul = sf_c(staff_df.at[u_idx, "Cumulative_UL"]) if "Cumulative_UL" in staff_df.columns else 0.0
-                                    staff_df.at[u_idx, penalty_col] = eff + curr_eff + u_ul + c_ul
-
-                                _gsheets_retry(conn.update, worksheet="Staff_Master", data=inject_balance_formulas(staff_df))
-                        _invalidate_sheet_cache("LeaveRequests", "Staff_Master")
-                        emp_top = get_user_ntfy_topic(e_name)
-                        if emp_top:
-                            send_ntfy_notification(
-                                emp_top,
-                                "Leave Cancelled & Balance Restored 🔄",
-                                f"Admin {st.session_state.user_name} cancelled your {row['LeaveType']} request ({l_days} days). Your balance has been restored!"
-                            )
-                        st.success(f"Cancelled leave #{row['ID']} for {e_name} and restored {l_days} day(s)!")
-                        st.rerun()
             
             # Pagination Controls
             st.divider()
