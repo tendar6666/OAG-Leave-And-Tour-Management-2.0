@@ -6936,6 +6936,7 @@ def render_system_settings(is_admin=True):
                         "Active Financial Year (Active_FY)",
                         value=get_current_financial_year_dates()[2],
                         help=STAFF_MASTER_FIELD_HELP["Active_FY"],
+                        disabled=True,
                     )
                 with c_n2:
                     add_role_opts = (
@@ -7190,7 +7191,7 @@ def render_system_settings(is_admin=True):
                         value=cur_fy_val,
                         help=STAFF_MASTER_FIELD_HELP["Active_FY"],
                         key=f"ed_fy_{e_user}",
-                        disabled=not is_central_viewer,
+                        disabled=True,
                     )
 
             if is_central_viewer and str(edit_role).strip() == "Auditor":
@@ -7236,35 +7237,99 @@ def render_system_settings(is_admin=True):
                 orig_cur_eff = float(_safe_num(sm_row.get("Current Year Leave affecting Service Year", 0.0)))
                 orig_cum_eff = float(_safe_num(sm_row.get("Cummulative leave effecting Service year.(Education Leave & Etc).", 0.0)))
 
-                # Card 2A: Service Tenure & Penalty
+                # Card 2A: Service Tenure & Penalty (Locked Service Year & Actual Service Year; Smart Y/M/D Penalty Editor)
+                live_cal_days = max(0, (get_cta_today() - edit_join).days)
+                live_svc_yr = round(live_cal_days / 365.25, 2)
+
+                peny_key = f"ed_peny_{e_user}"
+                penm_key = f"ed_penm_{e_user}"
+                pend_key = f"ed_pend_{e_user}"
+                if peny_key not in st.session_state or penm_key not in st.session_state or pend_key not in st.session_state:
+                    init_tot_pen = max(0.0, float(cur_svc_pen))
+                    init_py = int(init_tot_pen // 365.0)
+                    rem_pen = init_tot_pen - (init_py * 365.0)
+                    init_pm = int(rem_pen // 30.0)
+                    init_pd = round((rem_pen - (init_pm * 30.0)) * 2.0) / 2.0
+                    st.session_state[peny_key] = init_py
+                    st.session_state[penm_key] = init_pm
+                    st.session_state[pend_key] = float(init_pd)
+
+                def _normalize_svc_penalty_ymd(yk=peny_key, mk=penm_key, dk=pend_key):
+                    yv = max(0, int(st.session_state.get(yk, 0) or 0))
+                    mv = max(0, int(st.session_state.get(mk, 0) or 0))
+                    dv = max(0.0, float(st.session_state.get(dk, 0.0) or 0.0))
+                    tot_d = (yv * 365.0) + (mv * 30.0) + dv
+                    ny = int(tot_d // 365.0)
+                    rem = tot_d - (ny * 365.0)
+                    nm = int(rem // 30.0)
+                    nd = round((rem - (nm * 30.0)) * 2.0) / 2.0
+                    st.session_state[yk] = ny
+                    st.session_state[mk] = nm
+                    st.session_state[dk] = float(nd)
+
+                cur_pen_y = int(st.session_state.get(peny_key, 0) or 0)
+                cur_pen_m = int(st.session_state.get(penm_key, 0) or 0)
+                cur_pen_d = float(st.session_state.get(pend_key, 0.0) or 0.0)
+                ed_svc_pen = max(0.0, (cur_pen_y * 365.0) + (cur_pen_m * 30.0) + cur_pen_d)
+                live_act_days = max(0.0, float(live_cal_days) - ed_svc_pen)
+                live_act_svc = round(live_act_days / 365.25, 2)
+
                 with st.container(border=True):
                     st.markdown(
                         f"###### ⏳ Service Tenure & Penalty — "
-                        f"`Actual Service Year ({cur_act_svc:.2f}y) = ((Today - JoiningDate) - Penalty ({cur_svc_pen:g}d)) / 365.25`"
+                        f"`Actual Service Year ({live_act_svc:.2f}y) = ((Today - JoiningDate) - Penalty ({ed_svc_pen:g}d)) / 365.25`"
                     )
-                    c_sv1, c_sv2, c_sv3 = st.columns(3)
+                    st.caption(
+                        "🔒 **Service Year** and **Actual Service Year** are locked (auto-calculated from `JoiningDate` to Today). "
+                        "Edit **Service Penalty** in **Years, Months, or Days** — typing `365` days automatically converts to `1 Year` (and `30` days to `1 Month`)."
+                    )
+                    c_sv1, c_py, c_pm, c_pd, c_sv3 = st.columns([1.3, 1.0, 1.0, 1.1, 1.3])
                     ed_svc_yr = c_sv1.number_input(
-                        "Service Year",
-                        value=cur_svc_yr,
+                        "Service Year 🔒",
+                        value=live_svc_yr,
                         step=0.01,
                         format="%.2f",
                         help=STAFF_MASTER_FIELD_HELP["Service Year"],
                         key=f"ed_svcyr_{e_user}",
+                        disabled=True,
                     )
-                    ed_svc_pen = c_sv2.number_input(
-                        "Service Year Penalty",
-                        value=cur_svc_pen,
+                    c_py.number_input(
+                        "Penalty (Years)",
+                        min_value=0,
+                        step=1,
+                        key=peny_key,
+                        on_change=_normalize_svc_penalty_ymd,
+                        help="Penalty years (1 Year = 365 days).",
+                    )
+                    c_pm.number_input(
+                        "Penalty (Months)",
+                        min_value=0,
+                        step=1,
+                        key=penm_key,
+                        on_change=_normalize_svc_penalty_ymd,
+                        help="Penalty months (1 Month = 30 days; 12+ months auto-converts to Years).",
+                    )
+                    c_pd.number_input(
+                        "Penalty (Days)",
+                        min_value=0.0,
                         step=0.5,
-                        help=STAFF_MASTER_FIELD_HELP["Service Year Penalty"],
-                        key=f"ed_svcpen_{e_user}",
+                        format="%.1f",
+                        key=pend_key,
+                        on_change=_normalize_svc_penalty_ymd,
+                        help="Penalty days (type 365 days and press Enter to auto-convert to 1 Year; 30 days auto-converts to 1 Month).",
                     )
                     ed_act_svc = c_sv3.number_input(
-                        "Actual Service Year",
-                        value=cur_act_svc,
+                        "Actual Service Year 🔒",
+                        value=live_act_svc,
                         step=0.01,
                         format="%.2f",
                         help=STAFF_MASTER_FIELD_HELP["Actual Service Year"],
                         key=f"ed_actsvc_{e_user}",
+                        disabled=True,
+                    )
+                    st.caption(
+                        f"📊 **Total Service Penalty:** `{cur_pen_y} Year(s), {cur_pen_m} Month(s), {cur_pen_d:g} Day(s)` "
+                        f"= **`{ed_svc_pen:g} total days`** (`{ed_svc_pen / 365.0:.2f} yr`)"
                     )
 
                 # Card 2B: Casual Leave (CL)
@@ -7529,16 +7594,24 @@ def render_system_settings(is_admin=True):
                             staff_df.at[sm_idx, "Cumulative_UL"] = ed_cum_ul
                             staff_df.at[sm_idx, "Last_UL_Milestone"] = ed_ms_ul
                             staff_df.at[sm_idx, "Current Year Leave affecting Service Year"] = ed_cur_eff
-                            staff_df.at[sm_idx, "Cummulative leave effecting Service year.(Education Leave & Etc)."] = ed_cum_eff
+                            # If Service Year Penalty was edited via the Y/M/D penalty inputs while component fields stayed untouched, sync cumulative service-affecting days so live tenure reflects the penalty
+                            pen_components_untouched = (
+                                abs(ed_u_ul - orig_u_ul) < 1e-6
+                                and abs(ed_cum_ul - orig_cum_ul) < 1e-6
+                                and abs(ed_cur_eff - orig_cur_eff) < 1e-6
+                                and abs(ed_cum_eff - orig_cum_eff) < 1e-6
+                            )
+                            if abs(ed_svc_pen - cur_svc_pen) > 1e-6 and pen_components_untouched:
+                                final_cum_eff = max(0.0, orig_cum_eff + (ed_svc_pen - cur_svc_pen))
+                            else:
+                                final_cum_eff = ed_cum_eff
+                            staff_df.at[sm_idx, "Cummulative leave effecting Service year.(Education Leave & Etc)."] = final_cum_eff
+                            staff_df.at[sm_idx, "Service Year Penalty"] = ed_svc_pen
 
                         synced_sm = inject_balance_formulas(staff_df)
-                        if is_central_viewer:
-                            if abs(ed_svc_yr - cur_svc_yr) > 1e-6:
-                                synced_sm.at[sm_idx, "Service Year"] = ed_svc_yr
-                            if abs(ed_svc_pen - cur_svc_pen) > 1e-6:
-                                synced_sm.at[sm_idx, "Service Year Penalty"] = ed_svc_pen
-                            if abs(ed_act_svc - cur_act_svc) > 1e-6:
-                                synced_sm.at[sm_idx, "Actual Service Year"] = ed_act_svc
+                        if is_central_viewer and abs(ed_svc_pen - cur_svc_pen) > 1e-6:
+                            synced_sm.at[sm_idx, "Service Year Penalty"] = ed_svc_pen
+                            synced_sm.at[sm_idx, "Actual Service Year"] = live_act_svc
 
                         _gsheets_retry(conn.update, worksheet="Staff_Master", data=synced_sm)
 
@@ -8605,7 +8678,7 @@ def branch_manager_dashboard():
                                     st.rerun()
 
             st.divider()
-            st.subheader(f"Historical Leaves for {bm_branch} Staff")
+            st.subheader(f"Approved Leaves (PDF Archive) — {bm_branch} Staff")
             branch_hist_leaves = bm_scoped_leaves[
                 (bm_scoped_leaves["Name"].isin(branch_staff_names)) &
                 (bm_scoped_leaves["Status"].astype(str).str.strip().isin(["Approved", "Rejected", "Cancelled"]))
@@ -8614,8 +8687,127 @@ def branch_manager_dashboard():
             if branch_hist_leaves.empty:
                 st.caption("No processed leave history for this branch yet.")
             else:
-                disp_h = [c for c in ["ID", "Name", "LeaveType", "TotalDays", "StartDate", "EndDate", "Status", "ApprovedBy"] if c in branch_hist_leaves.columns]
-                st.dataframe(branch_hist_leaves[disp_h], use_container_width=True)
+                if "page_bm_hist_leaves" not in st.session_state:
+                    st.session_state.page_bm_hist_leaves = 0
+                bm_lv_per_page = 10
+                tot_bm_lv = len(branch_hist_leaves)
+                tot_bm_lv_pages = max(1, (tot_bm_lv - 1) // bm_lv_per_page + 1)
+                if st.session_state.page_bm_hist_leaves >= tot_bm_lv_pages:
+                    st.session_state.page_bm_hist_leaves = tot_bm_lv_pages - 1
+                bml_s = st.session_state.page_bm_hist_leaves * bm_lv_per_page
+                bml_e = bml_s + bm_lv_per_page
+
+                for _, row in branch_hist_leaves.iloc[bml_s:bml_e].iterrows():
+                    is_bm_h_act = _is_active_sheet_row(row)
+                    row_st = str(row.get("Status", "")).strip()
+                    col1, col2, col3 = st.columns([3.5, 1.2, 1.5])
+                    st_suffix = "" if row_st == "Approved" else f" — Status: {row_st}"
+                    col1.write(f"**{row['Name']}** — {row['LeaveType']}: **{row['TotalDays']} Day(s)** ({row['StartDate']} to {row['EndDate']}){st_suffix}")
+                    if col2.button("📄 Preview", key=f"prev_bm_hist_{row['ID']}"):
+                        pdf_bytes = generate_leave_pdf(row)
+                        if pdf_bytes:
+                            open_pdf_dialog(pdf_bytes, f"{row['Name']}_{row['StartDate']}_Leave.pdf")
+                    if row_st == "Approved":
+                        if col3.button(
+                            "❌ Cancel & Refund",
+                            key=f"canc_bm_hist_{row['ID']}",
+                            disabled=not is_bm_h_act,
+                            help="Cancel this approved leave and automatically restore days back to employee balance.",
+                        ):
+                            with st.spinner("Cancelling leave & refunding balance..."):
+                                act_m = df_requests[df_requests["ID"].map(_normalize_record_id) == _normalize_record_id(row["ID"])].index
+                                if not act_m.empty:
+                                    df_requests.loc[act_m, "Status"] = "Cancelled"
+                                    _gsheets_retry(conn.update, worksheet="LeaveRequests", data=df_requests)
+                                e_name = row["Name"]
+                                l_type = str(row["LeaveType"]).replace("Return-", "")
+                                l_days = float(row["TotalDays"]) if pd.notnull(row["TotalDays"]) else 0.0
+                                try:
+                                    l_start = _parse_cta_date(row["StartDate"]) or pd.to_datetime(row["StartDate"]).date()
+                                    l_end = _parse_cta_date(row["EndDate"]) or pd.to_datetime(row["EndDate"]).date()
+                                    bdown = get_leave_fy_breakdown(l_start, l_end, l_days)
+                                    cur_fy_s, _, _ = get_current_financial_year_dates()
+                                    if bdown:
+                                        cur_fy_days = float(bdown[cur_fy_s.year]["days"]) if cur_fy_s.year in bdown else 0.0
+                                        prior_fy_days = sum(float(v["days"]) for y, v in bdown.items() if y < cur_fy_s.year)
+                                    else:
+                                        cur_fy_days = l_days
+                                        prior_fy_days = 0.0
+                                except Exception:
+                                    cur_fy_days = l_days
+                                    prior_fy_days = 0.0
+
+                                if staff_df is not None:
+                                    e_idx = staff_df[staff_df["Name"] == e_name].index
+                                    if not e_idx.empty:
+                                        u_idx = e_idx[0]
+                                        if l_type in ["CL", "SL", "AL", "UL"]:
+                                            u_col = f"Used_{l_type}"
+                                            if u_col in staff_df.columns:
+                                                cur_used = float(staff_df.at[u_idx, u_col]) if pd.notnull(staff_df.at[u_idx, u_col]) else 0.0
+                                                refund_used = cur_fy_days if l_type == "UL" else l_days
+                                                staff_df.at[u_idx, u_col] = max(0.0, cur_used - refund_used)
+                                            b_col = f"Balance_{l_type}"
+                                            if b_col in staff_df.columns:
+                                                cur_bal = float(staff_df.at[u_idx, b_col]) if pd.notnull(staff_df.at[u_idx, b_col]) else 0.0
+                                                staff_df.at[u_idx, b_col] = max(0.0, cur_bal + (cur_fy_days if l_type == "UL" else l_days))
+                                            if l_type == "UL" and prior_fy_days != 0.0:
+                                                if "Cumulative_UL" in staff_df.columns:
+                                                    c_ul_val = float(staff_df.at[u_idx, "Cumulative_UL"]) if pd.notnull(staff_df.at[u_idx, "Cumulative_UL"]) else 0.0
+                                                    staff_df.at[u_idx, "Cumulative_UL"] = max(0.0, c_ul_val - prior_fy_days)
+                                                if "Opening_UL" in staff_df.columns:
+                                                    cur_open_ul = float(staff_df.at[u_idx, "Opening_UL"]) if pd.notnull(staff_df.at[u_idx, "Opening_UL"]) else 0.0
+                                                    staff_df.at[u_idx, "Opening_UL"] = max(0.0, cur_open_ul + prior_fy_days)
+                                                if b_col in staff_df.columns:
+                                                    staff_df.at[u_idx, b_col] = max(0.0, float(staff_df.at[u_idx, b_col]) + prior_fy_days)
+
+                                        if row.get("EffectsServiceYear") == "Yes":
+                                            c_col = "Current Year Leave affecting Service Year"
+                                            if c_col in staff_df.columns:
+                                                c_val = float(staff_df.at[u_idx, c_col]) if pd.notnull(staff_df.at[u_idx, c_col]) else 0.0
+                                                staff_df.at[u_idx, c_col] = max(0.0, c_val - cur_fy_days)
+                                            cum_eff_col = "Cummulative leave effecting Service year.(Education Leave & Etc)."
+                                            if prior_fy_days != 0.0 and cum_eff_col in staff_df.columns:
+                                                cur_eff_cum = float(staff_df.at[u_idx, cum_eff_col]) if pd.notnull(staff_df.at[u_idx, cum_eff_col]) else 0.0
+                                                staff_df.at[u_idx, cum_eff_col] = max(0.0, cur_eff_cum - prior_fy_days)
+
+                                        penalty_col = "Service Year Penalty"
+                                        if penalty_col in staff_df.columns:
+                                            def sf_bmc(val):
+                                                try: return float(val)
+                                                except: return 0.0
+                                            curr_eff = sf_bmc(staff_df.at[u_idx, "Current Year Leave affecting Service Year"]) if "Current Year Leave affecting Service Year" in staff_df.columns else 0.0
+                                            eff = sf_bmc(staff_df.at[u_idx, "Cummulative leave effecting Service year.(Education Leave & Etc)."]) if "Cummulative leave effecting Service year.(Education Leave & Etc)." in staff_df.columns else 0.0
+                                            u_ul = sf_bmc(staff_df.at[u_idx, "Used_UL"]) if "Used_UL" in staff_df.columns else 0.0
+                                            c_ul = sf_bmc(staff_df.at[u_idx, "Cumulative_UL"]) if "Cumulative_UL" in staff_df.columns else 0.0
+                                            staff_df.at[u_idx, penalty_col] = eff + curr_eff + u_ul + c_ul
+
+                                        _gsheets_retry(conn.update, worksheet="Staff_Master", data=inject_balance_formulas(staff_df))
+                                _invalidate_sheet_cache("LeaveRequests", "Staff_Master")
+                                emp_top = get_user_ntfy_topic(e_name)
+                                if emp_top:
+                                    send_ntfy_notification(
+                                        emp_top,
+                                        "Leave Cancelled & Balance Restored 🔄",
+                                        f"Branch Manager {bm_name} cancelled your {row['LeaveType']} request ({l_days} days). Your balance has been restored!"
+                                    )
+                                st.success(f"Cancelled leave #{row['ID']} for {e_name} and restored {l_days} day(s)!")
+                                st.rerun()
+
+                st.divider()
+                p_bml1, p_bml2, p_bml3 = st.columns([1, 2, 1])
+                with p_bml1:
+                    if st.session_state.page_bm_hist_leaves > 0:
+                        if st.button("⬅️ Previous", key="prev_bm_hist_lv_btn"):
+                            st.session_state.page_bm_hist_leaves -= 1
+                            st.rerun()
+                with p_bml2:
+                    st.markdown(f"<div style='text-align: center'>Page {st.session_state.page_bm_hist_leaves + 1} of {tot_bm_lv_pages}</div>", unsafe_allow_html=True)
+                with p_bml3:
+                    if st.session_state.page_bm_hist_leaves < tot_bm_lv_pages - 1:
+                        if st.button("Next ➡️", key="next_bm_hist_lv_btn"):
+                            st.session_state.page_bm_hist_leaves += 1
+                            st.rerun()
         else:
             st.info("No leave requests found.")
 
@@ -8803,8 +8995,38 @@ def branch_manager_dashboard():
             if branch_hist_tours.empty:
                 st.caption("No processed tour records for this branch yet.")
             else:
-                disp_t_cols = [c for c in ["ID", "Name", "Destination", "DepartureDate", "ArrivalDate", "TotalDays", "Status", "BMSupportedBy", "SupportedBy", "SanctionedBy", "ApprovedBy", "AccountsPunched"] if c in branch_hist_tours.columns]
-                st.dataframe(branch_hist_tours[disp_t_cols], use_container_width=True)
+                if "page_bm_hist_tours" not in st.session_state:
+                    st.session_state.page_bm_hist_tours = 0
+                bm_tr_per_page = 10
+                tot_bm_tr = len(branch_hist_tours)
+                tot_bm_tr_pages = max(1, (tot_bm_tr - 1) // bm_tr_per_page + 1)
+                if st.session_state.page_bm_hist_tours >= tot_bm_tr_pages:
+                    st.session_state.page_bm_hist_tours = tot_bm_tr_pages - 1
+                bmt_s = st.session_state.page_bm_hist_tours * bm_tr_per_page
+                bmt_e = bmt_s + bm_tr_per_page
+
+                for _, r in branch_hist_tours.iloc[bmt_s:bmt_e].iterrows():
+                    c_info, c_pdf = st.columns([5, 1])
+                    c_info.write(f"**{r['Name']}** — Tour to **{r['Destination']}** ({r['DepartureDate']} to {r['ArrivalDate']}) — Status: {r['Status']}")
+                    if c_pdf.button("📄 PDF", key=f"bm_arch_tr_pdf_{r['ID']}"):
+                        pdf_bytes = generate_tour_sanction_pdf(r)
+                        if pdf_bytes:
+                            open_pdf_dialog(pdf_bytes, f"{r['Name']}_{r['DepartureDate']}_Tour.pdf")
+
+                st.divider()
+                pt_bm1, pt_bm2, pt_bm3 = st.columns([1, 2, 1])
+                with pt_bm1:
+                    if st.session_state.page_bm_hist_tours > 0:
+                        if st.button("⬅️ Previous Tours", key="prev_bm_hist_tr_btn"):
+                            st.session_state.page_bm_hist_tours -= 1
+                            st.rerun()
+                with pt_bm2:
+                    st.markdown(f"<div style='text-align: center'>Tour Page {st.session_state.page_bm_hist_tours + 1} of {tot_bm_tr_pages}</div>", unsafe_allow_html=True)
+                with pt_bm3:
+                    if st.session_state.page_bm_hist_tours < tot_bm_tr_pages - 1:
+                        if st.button("Next Tours ➡️", key="next_bm_hist_tr_btn"):
+                            st.session_state.page_bm_hist_tours += 1
+                            st.rerun()
         else:
             st.info("No tour records found.")
 
