@@ -5355,9 +5355,21 @@ def employee_dashboard(hide_title=False):
         tours_df = emp_fy_records["tours"]
         my_tours = tours_df[tours_df["Name"] == st.session_state.user_name] if tours_df is not None and not tours_df.empty and "Name" in tours_df.columns else pd.DataFrame()
 
-        # 1. Prominent Current Tour Sanction Card
+        # 1. Prominent Current Tour Sanction Card (only active/upcoming or pending tours)
+        cur_tr = None
         if not my_tours.empty:
-            cur_tr = my_tours.iloc[0]
+            today_d = get_cta_today()
+            for _, cand_tr in my_tours.iterrows():
+                cand_st = str(cand_tr.get("Status", "Pending")).strip()
+                if cand_st in ("Rejected", "Cancelled", "Completed", "Settled"):
+                    continue
+                arr_d = _parse_cta_date(cand_tr.get("ArrivalDate")) or _parse_cta_date(cand_tr.get("DepartureDate"))
+                # Show if still pending approval OR if sanctioned tour has not ended yet (ArrivalDate >= today)
+                if cand_st not in ("Sanctioned", "Approved") or (arr_d is not None and arr_d >= today_d):
+                    cur_tr = cand_tr
+                    break
+
+        if cur_tr is not None:
             tr_status = str(cur_tr.get("Status", "Pending"))
             is_cur_tr_active = _is_active_sheet_row(cur_tr)
             with st.container(border=True):
@@ -8610,7 +8622,10 @@ def branch_manager_dashboard():
     # --- TAB 2: BRANCH TOUR SANCTIONS ---
     with tab_bm_tours:
         st.subheader(f"✈️ Official Tour Sanctions for {branch_full_name} ({bm_branch}) Staff")
-        st.caption(f"As Branch Manager, you have direct sanctioning authority for official duty travel submitted by {bm_branch} staff.")
+        st.caption(
+            f"As Branch Manager, you review and support official duty tour applications submitted by {bm_branch} staff "
+            f"before they are forwarded to Co-Admin and Admin (Drungche) for final sanction."
+        )
 
         tours_df = tours_df_raw
         if bm_scoped_tours is not None and not bm_scoped_tours.empty:
@@ -8619,16 +8634,22 @@ def branch_manager_dashboard():
                 ((bm_scoped_tours["Branch"].apply(normalize_branch_code) == bm_branch) & (bm_scoped_tours["Name"] != bm_name))
             ]
 
-            pending_branch_tours = branch_tours[
-                ~branch_tours["Status"].astype(str).str.strip().isin([
-                    "Sanctioned", "Completed", "Settled", "Rejected", "Cancelled"
-                ])
-            ]
+            def _is_bm_already_supported(row_s):
+                v = "" if pd.isna(row_s.get("BMSupportedBy")) else str(row_s.get("BMSupportedBy")).strip()
+                return v not in ("", "nan", "None")
+
+            bm_done_mask = branch_tours.apply(_is_bm_already_supported, axis=1) if not branch_tours.empty else pd.Series([], dtype=bool)
+            terminal_st_mask = branch_tours["Status"].astype(str).str.strip().isin([
+                "Sanctioned", "Completed", "Settled", "Rejected", "Cancelled",
+                "Pending Co-Admin Support", "Pending Admin Sanction",
+            ]) if not branch_tours.empty else pd.Series([], dtype=bool)
+
+            pending_branch_tours = branch_tours[~terminal_st_mask & ~bm_done_mask]
 
             if pending_branch_tours.empty:
                 st.info(f"✅ No pending tour requests from {bm_branch} staff. All caught up!")
             else:
-                st.warning(f"🔔 You have {len(pending_branch_tours)} tour sanction request(s) waiting for review from your branch staff.")
+                st.warning(f"🔔 You have {len(pending_branch_tours)} tour sanction request(s) waiting for your review & support from your branch staff.")
                 for idx, tr in pending_branch_tours.iterrows():
                     is_bm_tr_act = _is_active_sheet_row(tr)
                     with st.expander(f"✈️ {tr['Name']} — Tour to {tr['Destination']} ({tr['TotalDays']} Day(s))", expanded=True):
@@ -8718,13 +8739,19 @@ def branch_manager_dashboard():
                                                     "Tour Request to Support ✈️",
                                                     f"Branch Manager {bm_name} ({bm_branch}) supported {tr['Name']}'s Tour to {tr['Destination']}. Now awaiting your Co-Admin support."
                                                 )
+                                            adm_top = get_user_ntfy_topic(assigned_adm) or get_role_ntfy_topics("Admin")
+                                            send_ntfy_notification(
+                                                adm_top,
+                                                "Tour Request Supported by Branch Manager 🤝",
+                                                f"Branch Manager {bm_name} ({bm_branch}) supported Tour to {tr['Destination']} for {tr['Name']}. Forwarded to Co-Admin ({sel_co}) & Admin for sanction."
+                                            )
                                             if emp_top:
                                                 send_ntfy_notification(
                                                     emp_top,
                                                     "Tour Supported by Branch Manager 🤝",
-                                                    f"Branch Manager {bm_name} supported your Tour to {tr['Destination']}. Forwarded to Co-Admin ({sel_co}) for support."
+                                                    f"Branch Manager {bm_name} supported your Tour to {tr['Destination']}. Forwarded to Co-Admin ({sel_co}) & Admin ({assigned_adm})."
                                                 )
-                                            st.success(f"✅ Supported Tour for {tr['Name']}! Forwarded to Co-Admin {sel_co}.")
+                                            st.success(f"✅ Supported Tour for {tr['Name']}! Forwarded to Co-Admin {sel_co} & Admin {assigned_adm}.")
                                         else:
                                             adm_top = get_user_ntfy_topic(assigned_adm) or get_role_ntfy_topics("Admin")
                                             send_ntfy_notification(
@@ -8771,14 +8798,12 @@ def branch_manager_dashboard():
 
             st.divider()
             st.subheader(f"Sanctioned & Historical Tours for {bm_branch} Staff")
-            branch_hist_tours = branch_tours[
-                branch_tours["Status"].astype(str).str.strip().isin(["Sanctioned", "Completed", "Settled", "Rejected", "Cancelled"])
-            ]
+            branch_hist_tours = branch_tours[terminal_st_mask | bm_done_mask]
 
             if branch_hist_tours.empty:
                 st.caption("No processed tour records for this branch yet.")
             else:
-                disp_t_cols = [c for c in ["ID", "Name", "Destination", "DepartureDate", "ArrivalDate", "TotalDays", "Status", "SanctionedBy", "ApprovedBy", "AccountsPunched"] if c in branch_hist_tours.columns]
+                disp_t_cols = [c for c in ["ID", "Name", "Destination", "DepartureDate", "ArrivalDate", "TotalDays", "Status", "BMSupportedBy", "SupportedBy", "SanctionedBy", "ApprovedBy", "AccountsPunched"] if c in branch_hist_tours.columns]
                 st.dataframe(branch_hist_tours[disp_t_cols], use_container_width=True)
         else:
             st.info("No tour records found.")
@@ -9150,13 +9175,26 @@ def admin_dashboard():
         st.caption("Central Admin holds sole sanctioning authority for official duty tours.")
         tours_df = tours_df_adm_raw
         if adm_scoped_tours is not None and not adm_scoped_tours.empty:
-            pending_tours = adm_scoped_tours[
-                adm_scoped_tours["Status"].astype(str).str.strip().isin([
-                    "Pending Admin Sanction", "Pending Sanction", "Pending", 
-                    "Pending Recommendation", "Pending Co-Admin Support", 
-                    "Pending Branch Manager Support"
-                ])
-            ]
+            def _admin_can_see_pending_tour(row_t):
+                st_clean = str(row_t.get("Status", "")).strip()
+                if st_clean not in (
+                    "Pending Admin Sanction", "Pending Sanction", "Pending",
+                    "Pending Recommendation", "Pending Co-Admin Support",
+                ):
+                    return False
+                br_t = normalize_branch_code(str(row_t.get("Branch", "")))
+                bm_assigned = "" if pd.isna(row_t.get("BranchManager")) else str(row_t.get("BranchManager")).strip()
+                bm_supported = "" if pd.isna(row_t.get("BMSupportedBy")) else str(row_t.get("BMSupportedBy")).strip()
+                if bm_assigned in ("nan", "None"):
+                    bm_assigned = ""
+                if bm_supported in ("nan", "None"):
+                    bm_supported = ""
+                # Branch subordinate tour must be supported by Branch Manager first before Co-Admin & Admin see it
+                if bm_assigned and not bm_supported:
+                    return False
+                return True
+
+            pending_tours = adm_scoped_tours[adm_scoped_tours.apply(_admin_can_see_pending_tour, axis=1)]
             if pending_tours.empty:
                 st.info("No pending tour sanctions to approve. Good job!")
             else:
@@ -9427,18 +9465,8 @@ def coadmin_dashboard():
 
             to_support_tours = co_scoped_tours[co_scoped_tours.apply(_co_can_see_tour, axis=1)]
 
-            # Mention branch tours waiting for Branch Manager approval
-            waiting_bm_tours = co_scoped_tours[
-                (co_scoped_tours["SelectedCoAdmin"].astype(str).str.strip() == str(st.session_state.user_name).strip()) &
-                (co_scoped_tours["Status"].astype(str).str.strip().isin(["Pending Branch Manager Support"]))
-            ]
-            if not waiting_bm_tours.empty:
-                cnt_bm_wait = len(waiting_bm_tours)
-                st.info(f"⏳ **Status: Pending Branch Manager Support (Or Approve)** — You have **{cnt_bm_wait}** branch tour request(s) awaiting Branch Manager approval before reaching you for support.")
-
             if to_support_tours.empty:
-                if waiting_bm_tours.empty:
-                    st.info("No tour applications awaiting your endorsement.")
+                st.info("No tour applications awaiting your endorsement.")
             else:
                 for idx, tr in to_support_tours.iterrows():
                     is_co_tr_act = _is_active_sheet_row(tr)
@@ -9929,10 +9957,13 @@ def render_smart_notifications(role, user_name):
                             st.rerun()
 
         if tours_df is not None and not tours_df.empty and "Status" in tours_df.columns:
+            bm_sup_col = tours_df["BMSupportedBy"].fillna("").astype(str).str.strip() if "BMSupportedBy" in tours_df.columns else pd.Series([""] * len(tours_df), index=tours_df.index)
             bm_pending_tours = tours_df[
                 (tours_df["Name"].isin(b_staff)) &
+                (bm_sup_col.isin(["", "nan", "None"])) &
                 (~tours_df["Status"].astype(str).str.strip().isin([
-                    "Sanctioned", "Completed", "Settled", "Rejected", "Cancelled"
+                    "Sanctioned", "Completed", "Settled", "Rejected", "Cancelled",
+                    "Pending Co-Admin Support", "Pending Admin Sanction",
                 ]))
             ]
             if not bm_pending_tours.empty:
@@ -9940,22 +9971,29 @@ def render_smart_notifications(role, user_name):
                 with st.container():
                     c_msg, c_act = st.columns([4, 1.2])
                     with c_msg:
-                        st.warning(f"✈️ **{bm_branch} Tour Sanctions:** You have **{cnt_bm_tr}** tour sanction request(s) from your branch staff waiting for your review & sanction!")
+                        st.warning(f"✈️ **{bm_branch} Tour Sanctions:** You have **{cnt_bm_tr}** tour sanction request(s) from your branch staff waiting for your review & support!")
                     with c_act:
                         if st.button("Review Tours ✈️", key="top_notif_bm_tours", type="primary", use_container_width=True):
                             st.session_state.bm_tabs = f"✈️ {bm_branch} Tour Sanctions"
                             st.rerun()
 
     elif role == "Admin":
-        # 1. Official Tour Sanctions pending approval
+        # 1. Official Tour Sanctions pending approval (after passing Branch Manager support if branch staff)
         if tours_df is not None and not tours_df.empty and "Status" in tours_df.columns:
-            pending_tours = tours_df[
-                tours_df["Status"].astype(str).str.strip().isin([
-                    "Pending Admin Sanction", "Pending Sanction", "Pending", 
-                    "Pending Recommendation", "Pending Co-Admin Support", 
-                    "Pending Branch Manager Support"
-                ])
-            ]
+            def _adm_notif_tour(row_t):
+                st_clean = str(row_t.get("Status", "")).strip()
+                if st_clean not in (
+                    "Pending Admin Sanction", "Pending Sanction", "Pending",
+                    "Pending Recommendation", "Pending Co-Admin Support",
+                ):
+                    return False
+                bm_assigned = "" if pd.isna(row_t.get("BranchManager")) else str(row_t.get("BranchManager")).strip()
+                bm_supported = "" if pd.isna(row_t.get("BMSupportedBy")) else str(row_t.get("BMSupportedBy")).strip()
+                if bm_assigned not in ("", "nan", "None") and bm_supported in ("", "nan", "None"):
+                    return False
+                return True
+
+            pending_tours = tours_df[tours_df.apply(_adm_notif_tour, axis=1)]
             if not pending_tours.empty:
                 cnt_tr = len(pending_tours)
                 with st.container():
