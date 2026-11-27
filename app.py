@@ -61,7 +61,7 @@ ENABLE_NTFY = True  # Targeted user-specific notifications active
 # --- DEVELOPMENT MODE CONFIGURATION ---
 # Set to True during development for easy 1-click login and instant user switching.
 # Set to False (or remove) before final production deployment.
-DEV_MODE = True
+DEV_MODE = False
 
 def get_user_ntfy_topic(user_name):
     """Retrieves the unique personal NTFY topic for a specific user from Users worksheet."""
@@ -11758,8 +11758,16 @@ def main_dashboard():
     st.sidebar.title(f"Welcome, {st.session_state.user_name}")
     st.sidebar.write(f"**Role:** {st.session_state.user_role}")
 
-    # DEV MODE QUICK SWITCHER (Active during development only)
-    if DEV_MODE:
+    # DEV MODE QUICK SWITCHER (Active for DEV_MODE or exclusively for authenticated owner tendar6666@gmail.com)
+    _owner_dev_email = "tendar6666@gmail.com"
+    _st_user_obj = getattr(st, "user", None)
+    _oauth_em = str(getattr(_st_user_obj, "email", "") or "").strip().lower() if getattr(_st_user_obj, "is_logged_in", False) else ""
+    _perim_em = str(st.session_state.get("perimeter_verified_email", "") or "").strip().lower()
+    _cur_em = str(st.session_state.get("user_email", "") or "").strip().lower()
+    if _oauth_em == _owner_dev_email or _perim_em == _owner_dev_email or _cur_em == _owner_dev_email:
+        st.session_state["_is_owner_dev_session"] = True
+
+    if DEV_MODE or st.session_state.get("_is_owner_dev_session", False):
         with st.sidebar.expander("🛠️ DEV: Switch Role / User", expanded=True):
             st.caption("⚡ Switch account instantly without logging out:")
             u_df_dev = load_users_data()
@@ -11845,6 +11853,7 @@ def main_dashboard():
         if st.button("🔒 Lock PIN", use_container_width=True, help="Lock dashboard with 4-digit PIN"):
             _release_submission_freeze()
             st.session_state.pop("branch_filter_state", None)
+            st.session_state.pop("_is_owner_dev_session", None)
             st.session_state.pending_cookie_delete = True
             st.session_state.logged_in = False
             st.rerun()
@@ -11852,6 +11861,7 @@ def main_dashboard():
         if st.button("🚪 Sign Out", use_container_width=True, help="Forget this browser & sign out completely"):
             _release_submission_freeze()
             st.session_state.pop("branch_filter_state", None)
+            st.session_state.pop("_is_owner_dev_session", None)
             st.session_state.pending_cookie_delete = True
             st.session_state.pending_full_signout = True
             st.session_state.logged_in = False
