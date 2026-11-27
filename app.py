@@ -6325,7 +6325,7 @@ def render_fy_rollover_simulator(scoped_staff_df, is_admin=True, key_prefix="sys
             c_act1, c_act2 = st.columns(2)
             with c_act1:
                 if st.button(
-                    f"⚡ Apply Test FY Rollover to Sheet ({format_fy_short(sim_info.get('target_fy', next_fy_lbl))})",
+                    f"⚡ Apply Test FY Rollover ({format_fy_short(sim_info.get('target_fy', next_fy_lbl))})",
                     type="primary",
                     use_container_width=True,
                     key=f"{key_prefix}_btn_apply_live_rollover_test",
@@ -6432,16 +6432,79 @@ def render_master_balance_table():
         st.info("No staff data found for the selected branch(es).")
 
 
+def _ensure_sys_settings_branch_state(viewer_name):
+    """Initializes independent System Settings branch checkboxes (HQ, DB, NB, SB) decoupled from the Calendar filter."""
+    owner_key = str(viewer_name or "").strip()
+    state = st.session_state.get("sys_settings_branch_filter_state")
+    if not isinstance(state, dict) or state.get("owner") != owner_key:
+        st.session_state["sys_settings_branch_filter_state"] = {
+            "owner": owner_key,
+            "HQ": True,
+            "DB": True,
+            "NB": True,
+            "SB": True,
+        }
+        for k in list(st.session_state.keys()):
+            if str(k).startswith("bf_sys_chk_"):
+                del st.session_state[k]
+    return st.session_state["sys_settings_branch_filter_state"]
+
+
+def _on_sys_settings_checkbox_change(widget_key, branch_code):
+    state = _ensure_sys_settings_branch_state(st.session_state.get("user_name", ""))
+    state[branch_code] = bool(st.session_state.get(widget_key, True))
+
+
+def render_system_settings_branch_filter(key_prefix="sys_settings"):
+    """Renders an independent Branch Filter (HQ, DB, NB, SB) inside System Settings for Central Admin & Central Accounts."""
+    viewer_name = st.session_state.get("user_name", "")
+    viewer_role = st.session_state.get("user_role", "Employee")
+    viewer_branch = get_user_branch(viewer_name) if viewer_name else "HQ"
+    if not is_central_branch_filter_role(viewer_role, viewer_branch):
+        return resolve_visible_branches(viewer_role, viewer_branch)
+
+    sys_state = _ensure_sys_settings_branch_state(viewer_name)
+    safe_user = "".join(ch if ch.isalnum() else "_" for ch in str(viewer_name))
+
+    with st.container(border=True):
+        cols = st.columns([1.4, 1, 1, 1, 1])
+        with cols[0]:
+            st.markdown("**Branch Filter:**")
+        for idx, b_code in enumerate(BRANCH_FILTER_ORDER):
+            wkey = f"bf_sys_chk_{key_prefix}_{safe_user}_{b_code}"
+            desired_val = bool(sys_state.get(b_code, True))
+            if wkey not in st.session_state:
+                st.session_state[wkey] = desired_val
+            with cols[idx + 1]:
+                st.checkbox(
+                    BRANCH_FILTER_LABELS.get(b_code, b_code),
+                    key=wkey,
+                    help=BRANCH_NAMES.get(b_code, b_code),
+                    on_change=_on_sys_settings_checkbox_change,
+                    args=(wkey, b_code),
+                )
+                # Sync state directly in case widget was toggled in a non-callback runner
+                sys_state[b_code] = bool(st.session_state.get(wkey, desired_val))
+
+    checked = [b for b in BRANCH_FILTER_ORDER if sys_state.get(b, True)]
+    if not checked:
+        st.warning("No branches selected. Check དབུས། (HQ), DB, NB, or SB above to view staff records in System Settings.")
+    return resolve_visible_branches(viewer_role, viewer_branch, checked)
+
+
 def render_system_settings(is_admin=True):
     st.subheader("⚙️ System Settings & Administration")
     st.caption("Complete administrative control panel for leave rules, staff profiles, balance adjustments, and offline backups.")
 
-    allowed_branches = get_active_visible_branches()
     branch_map = get_user_branch_map()
     viewer_name = st.session_state.get("user_name", "")
     viewer_role = st.session_state.get("user_role", "")
     viewer_branch = get_user_branch(viewer_name) if viewer_name else "HQ"
     is_central_viewer = is_central_branch_filter_role(viewer_role, viewer_branch)
+
+    allowed_branches = render_system_settings_branch_filter(
+        key_prefix=f"sys_set_{'adm' if is_admin else 'acct'}"
+    )
     if allowed_branches:
         st.caption(f"🔎 Active Branch Scope: **{format_branch_scope(allowed_branches)}**")
 
@@ -7762,19 +7825,11 @@ def render_system_settings(is_admin=True):
 
     # --- TAB 4: BALANCE ADJUSTMENTS ---
     with tab_adj:
-        # Central Admin and Central Accounts have full access across all branches
-        if is_central_viewer:
-            adj_scoped_df = staff_df
-            adj_branches = None
-        else:
-            adj_scoped_df = scoped_staff_df
-            adj_branches = allowed_branches
-
         render_balance_adjustment_panel(
             key_prefix=f"sys_{'adm' if is_admin else 'acct'}_adj",
-            scoped_staff_df=adj_scoped_df,
+            scoped_staff_df=scoped_staff_df,
             full_staff_df=staff_df,
-            allowed_branches=adj_branches,
+            allowed_branches=allowed_branches,
         )
 
     # --- TAB 4: NOTIFICATIONS & MOBILE ---
