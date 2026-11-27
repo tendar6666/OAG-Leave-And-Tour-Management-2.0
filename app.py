@@ -269,6 +269,21 @@ BRANCH_NAMES = {
     "DB": "Dekyiling Branch (བདེ་སྐྱིད་གླིང་ཡན་ལག)"
 }
 
+OFFICIAL_CTA_POSTS = [
+    "རྩིས་ཞིབ་སྤྱི་ཁྱབ་པ།",
+    "དྲུང་ཆེ།",
+    "དྲུང་འཕར།",
+    "ཟུང་དྲུང་།",
+    "དྲུང་གཞོན།",
+    "དྲུང་ལས།",
+    "སྡེ་འགན།",
+    "ལས་དོ།",
+    "ལས་དྲུང་།",
+    "རྒན་དྲུང་།",
+    "གཞོན་དྲུང་།",
+    "ལས་བྱ།",
+]
+
 
 @st.cache_data(ttl=60)
 def load_users_data():
@@ -6931,9 +6946,9 @@ def render_system_settings(is_admin=True):
                     help=STAFF_MASTER_FIELD_HELP["Name"],
                     key="add_stf_name",
                 )
-                new_post = st.text_input(
+                new_post = st.selectbox(
                     "Designation / Post (Tibetan Font) *",
-                    placeholder="e.g. ལས་དོ།",
+                    OFFICIAL_CTA_POSTS,
                     help=STAFF_MASTER_FIELD_HELP["Post"],
                     key="add_stf_post",
                 )
@@ -7229,9 +7244,17 @@ def render_system_settings(is_admin=True):
                         disabled=not is_central_viewer,
                     )
                 with c_ed2:
-                    edit_post = st.text_input(
+                    cur_post_val = str(u_row.get("Post", sm_row.get("Post", ""))).strip()
+                    if cur_post_val == "སྡེ་འགན":
+                        cur_post_val = "སྡེ་འགན།"
+                    post_opts_ed = list(OFFICIAL_CTA_POSTS)
+                    if cur_post_val and cur_post_val not in post_opts_ed:
+                        post_opts_ed.append(cur_post_val)
+                    def_post_idx = post_opts_ed.index(cur_post_val) if cur_post_val in post_opts_ed else 0
+                    edit_post = st.selectbox(
                         "Post",
-                        value=str(sm_row.get("Post", u_row.get("Post", ""))),
+                        post_opts_ed,
+                        index=def_post_idx,
                         help=STAFF_MASTER_FIELD_HELP["Post"],
                         key=f"ed_post_{e_user}",
                     )
@@ -11597,18 +11620,116 @@ Live active policy numbers loaded from `LeaveRules`:
 
 def main_dashboard():
 
-    # AUTO-SYNC USERS -> STAFF MASTER
+    # AUTO-SYNC USERS -> STAFF MASTER (in-place renames, new users, and direct Google Sheet edits to Post / JoiningDate / Branch)
     users_df = load_users_data()
     staff_df = load_staff_master()
     if users_df is not None and staff_df is not None:
+        sm_needs_sync = False
+
+        # Detect in-place row renames in Users (when a user overwrites an existing row's Name in Users)
+        if not users_df.empty and not staff_df.empty and "Name" in users_df.columns and "Name" in staff_df.columns:
+            non_aud_users = users_df[users_df["Role"].astype(str).str.strip() != "Auditor"].reset_index(drop=True) if "Role" in users_df.columns else users_df.reset_index(drop=True)
+            all_u_names = {str(x).strip() for x in non_aud_users["Name"].dropna().tolist() if str(x).strip()}
+            all_sm_names = {str(x).strip() for x in staff_df["Name"].dropna().tolist() if str(x).strip()}
+            min_len = min(len(non_aud_users), len(staff_df))
+            for pos_i in range(min_len):
+                u_nm_i = "" if pd.isna(non_aud_users.at[pos_i, "Name"]) else str(non_aud_users.at[pos_i, "Name"]).strip()
+                s_idx_i = staff_df.index[pos_i]
+                s_nm_i = "" if pd.isna(staff_df.at[s_idx_i, "Name"]) else str(staff_df.at[s_idx_i, "Name"]).strip()
+                if u_nm_i and s_nm_i and u_nm_i != s_nm_i and (u_nm_i not in all_sm_names) and (s_nm_i not in all_u_names):
+                    staff_df.at[s_idx_i, "Name"] = u_nm_i
+                    all_sm_names.discard(s_nm_i)
+                    all_sm_names.add(u_nm_i)
+                    sm_needs_sync = True
+
         missing_users = find_users_missing_from_staff_master(users_df, staff_df)
         if missing_users:
             new_df = pd.DataFrame(missing_users)
             staff_df = pd.concat([staff_df, new_df], ignore_index=True)
+            sm_needs_sync = True
+
+        # Sync Post, JoiningDate, and Branch from Users -> Staff_Master when edited directly in Google Sheets
+        if not users_df.empty and not staff_df.empty and "Name" in users_df.columns and "Name" in staff_df.columns:
+            u_profile_map = {}
+            for _, ur in users_df.iterrows():
+                unm = "" if pd.isna(ur.get("Name")) else str(ur.get("Name")).strip()
+                if unm:
+                    u_profile_map[unm] = ur
+            for s_idx in staff_df.index:
+                snm = "" if pd.isna(staff_df.at[s_idx, "Name"]) else str(staff_df.at[s_idx, "Name"]).strip()
+                if snm in u_profile_map:
+                    ur = u_profile_map[snm]
+                    for sync_col in ("Post", "JoiningDate", "Branch"):
+                        if sync_col in ur and sync_col in staff_df.columns:
+                            u_val = "" if pd.isna(ur.get(sync_col)) else str(ur.get(sync_col)).strip()
+                            s_val = "" if pd.isna(staff_df.at[s_idx, sync_col]) else str(staff_df.at[s_idx, sync_col]).strip()
+                            if sync_col == "JoiningDate" and u_val and s_val:
+                                # Normalize YYYY/MM/DD vs YYYY-MM-DD before comparing
+                                u_d = _parse_cta_date(u_val)
+                                s_d = _parse_cta_date(s_val)
+                                if u_d is not None and s_d == u_d:
+                                    continue
+                                if u_d is not None:
+                                    u_val = u_d.strftime("%Y-%m-%d")
+                            if u_val and u_val not in ("nan", "None") and u_val != s_val:
+                                staff_df.at[s_idx, sync_col] = u_val
+                                sm_needs_sync = True
+
+        if sm_needs_sync:
             _gsheets_retry(conn.update, worksheet="Staff_Master",
                            data=inject_balance_formulas(staff_df))
             _invalidate_sheet_cache("Staff_Master")
             st.rerun()
+        elif not staff_df.empty:
+            # Auto-recalculate all Grey Python-calculated columns whenever any Yellow input column was edited directly in Google Sheets
+            synced_check_df = inject_balance_formulas(staff_df)
+            grey_num_cols = (
+                "Service Year", "Service Year Penalty", "Actual Service Year",
+                "Penalty_CL(UL Effect)", "Balance_CL",
+                "Penalty_SL(UL Effect)", "Balance_SL",
+                "Penalty_AL(UL Effect)", "Balance_AL",
+                "Balance_UL",
+            )
+            grey_diff = False
+            for idx_s in staff_df.index:
+                # Recompute Last_UL_Milestone and Addition_UL from Actual Service Year & Opening_UL + Cumulative_UL
+                act_y_s = float(_safe_num(synced_check_df.at[idx_s, "Actual Service Year"])) if "Actual Service Year" in synced_check_df.columns else 0.0
+                o_ul_s = float(_safe_num(synced_check_df.at[idx_s, "Opening_UL"])) if "Opening_UL" in synced_check_df.columns else 0.0
+                c_ul_s = float(_safe_num(synced_check_df.at[idx_s, "Cumulative_UL"])) if "Cumulative_UL" in synced_check_df.columns else 0.0
+                u_ul_s = float(_safe_num(synced_check_df.at[idx_s, "Used_UL"])) if "Used_UL" in synced_check_df.columns else 0.0
+                calc_ms_s = float(min(20, int(act_y_s // 5) * 5))
+                pool_s = o_ul_s + c_ul_s
+                if (
+                    (calc_ms_s == 5.0 and pool_s < 182.5)
+                    or (calc_ms_s == 10.0 and pool_s < 365.0)
+                    or (calc_ms_s == 15.0 and pool_s < 547.5)
+                    or (calc_ms_s >= 20.0 and pool_s < 730.0)
+                ):
+                    calc_add_ul_s = 182.5
+                else:
+                    calc_add_ul_s = 0.0
+                calc_bal_ul_s = max(0.0, o_ul_s + calc_add_ul_s - u_ul_s)
+                if "Last_UL_Milestone" in synced_check_df.columns:
+                    synced_check_df.at[idx_s, "Last_UL_Milestone"] = calc_ms_s
+                if "Addition_UL" in synced_check_df.columns:
+                    synced_check_df.at[idx_s, "Addition_UL"] = calc_add_ul_s
+                if "Balance_UL" in synced_check_df.columns:
+                    synced_check_df.at[idx_s, "Balance_UL"] = calc_bal_ul_s
+
+                for g_col in grey_num_cols + ("Addition_UL", "Last_UL_Milestone"):
+                    if g_col in staff_df.columns and g_col in synced_check_df.columns:
+                        old_g = float(_safe_num(staff_df.at[idx_s, g_col]))
+                        new_g = float(_safe_num(synced_check_df.at[idx_s, g_col]))
+                        if abs(old_g - new_g) > 1e-4:
+                            grey_diff = True
+                            break
+                if grey_diff:
+                    break
+
+            if grey_diff:
+                _gsheets_retry(conn.update, worksheet="Staff_Master", data=synced_check_df)
+                _invalidate_sheet_cache("Staff_Master")
+                st.rerun()
 
     # Pre-load custom LeaveRules from Google Sheets on cold start before rollover & balance calculations
     try:
