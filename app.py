@@ -6492,6 +6492,83 @@ def render_system_settings_branch_filter(key_prefix="sys_settings"):
     return resolve_visible_branches(viewer_role, viewer_branch, checked)
 
 
+def render_service_leave_duration_calculator(key_prefix="svc_calc"):
+    """Renders a standalone multi-period Date-Range Duration Calculator (Start Date to End Date with '+ Add Another Period')
+    right below 'Current Year Leave affecting Service Year' and 'Cummulative leave effecting Service year.(Education Leave & Etc).'.
+    Pure helper calculator — does not overwrite any Staff_Master field automatically.
+    """
+    count_key = f"{key_prefix}_period_count"
+    if count_key not in st.session_state:
+        st.session_state[count_key] = 1
+
+    with st.expander("🧮 Leave Period Duration & Year Calculator (Start Date ➔ End Date Helper)", expanded=False):
+        st.caption(
+            "Use this standalone calculator to add one or multiple leave periods (**Start Date** to **End Date**, inclusive) "
+            "and see the exact **Total Days** and **Total Years** (`Days ÷ 365.25`) so you can easily type the number above."
+        )
+        total_days = 0
+        period_summaries = []
+        num_periods = max(1, int(st.session_state.get(count_key, 1)))
+
+        for i in range(num_periods):
+            c_p1, c_p2, c_p3 = st.columns([1.8, 1.8, 2.4])
+            with c_p1:
+                sd = st.date_input(
+                    f"Period #{i + 1} Start Date",
+                    value=get_cta_today(),
+                    min_value=date(1960, 1, 1),
+                    max_value=date(2040, 12, 31),
+                    key=f"{key_prefix}_sd_{i}",
+                )
+            with c_p2:
+                ed = st.date_input(
+                    f"Period #{i + 1} End Date",
+                    value=get_cta_today(),
+                    min_value=date(1960, 1, 1),
+                    max_value=date(2040, 12, 31),
+                    key=f"{key_prefix}_ed_{i}",
+                )
+            with c_p3:
+                st.write("")
+                if isinstance(sd, date) and isinstance(ed, date):
+                    if ed >= sd:
+                        p_days = (ed - sd).days + 1
+                        p_yrs = p_days / 365.25
+                        total_days += p_days
+                        period_summaries.append((i + 1, sd, ed, p_days, p_yrs))
+                        st.info(f"**Period #{i + 1}:** `{p_days:,} day(s)`  •  **`{p_yrs:.2f} year(s)`**")
+                    else:
+                        st.warning(f"⚠️ Period #{i + 1}: End Date is before Start Date")
+
+        b_c1, b_c2, _ = st.columns([1.4, 1.4, 2.2])
+        with b_c1:
+            if st.button("➕ Add Another Period", key=f"{key_prefix}_btn_add_period", use_container_width=True):
+                st.session_state[count_key] = num_periods + 1
+                st.rerun()
+        with b_c2:
+            if num_periods > 1:
+                if st.button("➖ Remove Last Period", key=f"{key_prefix}_btn_rem_period", use_container_width=True):
+                    idx_rem = num_periods - 1
+                    st.session_state.pop(f"{key_prefix}_sd_{idx_rem}", None)
+                    st.session_state.pop(f"{key_prefix}_ed_{idx_rem}", None)
+                    st.session_state[count_key] = max(1, num_periods - 1)
+                    st.rerun()
+
+        total_years = total_days / 365.25
+        approx_yrs = int(total_days // 365.25)
+        rem_days_after_yr = total_days - int(round(approx_yrs * 365.25))
+        approx_months = int(max(0, rem_days_after_yr) // 30.4375)
+        approx_rem_days = int(round(max(0, rem_days_after_yr) - (approx_months * 30.4375)))
+
+        st.success(
+            f"📊 **Calculator Result ({len(period_summaries)} period(s)):**  "
+            f"**Total Days = `{total_days:,} days`**   |   "
+            f"**Total Years = `{total_years:.2f} years`** "
+            f"*(≈ {approx_yrs} yr, {approx_months} mo, {approx_rem_days} d)*\n\n"
+            f"💡 *Note: The `Staff_Master` fields above store **Total Days** (e.g. enter `{total_days}` for `{total_years:.2f} years`).*"
+        )
+
+
 def render_system_settings(is_admin=True):
     st.subheader("⚙️ System Settings & Administration")
     st.caption("Complete administrative control panel for leave rules, staff profiles, balance adjustments, and offline backups.")
@@ -7209,6 +7286,7 @@ def render_system_settings(is_admin=True):
                     help=STAFF_MASTER_FIELD_HELP["Cummulative leave effecting Service year.(Education Leave & Etc)."],
                     key="add_cum_eff",
                 )
+                render_service_leave_duration_calculator(key_prefix="add_stf_svc_calc")
 
             if st.button("Create Staff Member & Save All Balances", type="primary", key="btn_create_new_staff"):
                 if not new_name.strip() or not new_post.strip():
@@ -7571,6 +7649,7 @@ def render_system_settings(is_admin=True):
                         help=STAFF_MASTER_FIELD_HELP["Cummulative leave effecting Service year.(Education Leave & Etc)."],
                         key=f"ed_cumeff_{e_user}",
                     )
+                    render_service_leave_duration_calculator(key_prefix=f"ed_stf_svc_calc_{e_user}")
 
             if st.button("💾 Save Staff Profile & Complete Leave Ledger", type="primary", key="btn_save_u_edit"):
                 with st.spinner("Updating staff profile and Staff_Master ledger..."):
