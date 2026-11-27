@@ -29,32 +29,6 @@ except Exception:
 
 _AUTO_ROLLOVER_LOCK = threading.Lock()
 
-import extra_streamlit_components as stx
-cookie_manager = stx.CookieManager(key="main_cookie_manager")
-
-if "pending_cookie" in st.session_state:
-    expire_date = datetime.now(CTA_TZ) + timedelta(days=60)
-    cookie_manager.set("auth_token", st.session_state.pending_cookie, key="set_auth_token", expires_at=expire_date)
-    del st.session_state.pending_cookie
-
-if "pending_gmail_cookie" in st.session_state:
-    expire_date = datetime.now(CTA_TZ) + timedelta(days=60)
-    cookie_manager.set("cta_verified_gmail", st.session_state.pending_gmail_cookie, key="set_verified_gmail", expires_at=expire_date)
-    del st.session_state.pending_gmail_cookie
-
-if st.session_state.get("pending_cookie_delete"):
-    try:
-        cookie_manager.delete("auth_token", key="del_auth_token")
-    except Exception:
-        pass
-    if st.session_state.get("pending_full_signout"):
-        try:
-            cookie_manager.delete("cta_verified_gmail", key="del_verified_gmail")
-        except Exception:
-            pass
-        del st.session_state["pending_full_signout"]
-    del st.session_state["pending_cookie_delete"]
-
 
 ENABLE_NTFY = True  # Targeted user-specific notifications active
 
@@ -133,6 +107,32 @@ from fpdf import FPDF
 # --- PAGE CONFIGURATION ---
 st.set_page_config(page_title="Leave Management System",
                     page_icon="📅", layout="wide")
+
+import extra_streamlit_components as stx
+cookie_manager = stx.CookieManager(key="main_cookie_manager")
+
+if "pending_cookie" in st.session_state:
+    expire_date = datetime.now(CTA_TZ) + timedelta(days=60)
+    cookie_manager.set("auth_token", st.session_state.pending_cookie, key="set_auth_token", expires_at=expire_date)
+    del st.session_state.pending_cookie
+
+if "pending_gmail_cookie" in st.session_state:
+    expire_date = datetime.now(CTA_TZ) + timedelta(days=60)
+    cookie_manager.set("cta_verified_gmail", st.session_state.pending_gmail_cookie, key="set_verified_gmail", expires_at=expire_date)
+    del st.session_state.pending_gmail_cookie
+
+if st.session_state.get("pending_cookie_delete"):
+    try:
+        cookie_manager.delete("auth_token", key="del_auth_token")
+    except Exception:
+        pass
+    if st.session_state.get("pending_full_signout"):
+        try:
+            cookie_manager.delete("cta_verified_gmail", key="del_verified_gmail")
+        except Exception:
+            pass
+        del st.session_state["pending_full_signout"]
+    del st.session_state["pending_cookie_delete"]
 
 # --- INITIALIZE SESSION STATE ---
 if "logged_in" not in st.session_state:
@@ -11843,9 +11843,9 @@ def main_dashboard():
             _gsheets_retry(conn.update, worksheet="Staff_Master",
                            data=inject_balance_formulas(staff_df))
             _invalidate_sheet_cache("Staff_Master")
-            st.rerun()
-        elif not staff_df.empty:
-            # Auto-recalculate all Grey Python-calculated columns whenever any Yellow input column was edited directly in Google Sheets
+        elif not staff_df.empty and not st.session_state.get("_grey_cols_verified_once", False):
+            # Auto-recalculate all Grey Python-calculated columns once per session or after Refresh Data
+            st.session_state["_grey_cols_verified_once"] = True
             synced_check_df = inject_balance_formulas(staff_df)
             grey_num_cols = (
                 "Service Year", "Service Year Penalty", "Actual Service Year",
@@ -11893,7 +11893,6 @@ def main_dashboard():
             if grey_diff:
                 _gsheets_retry(conn.update, worksheet="Staff_Master", data=synced_check_df)
                 _invalidate_sheet_cache("Staff_Master")
-                st.rerun()
 
     # Pre-load custom LeaveRules from Google Sheets on cold start before rollover & balance calculations
     try:
@@ -11981,6 +11980,7 @@ def main_dashboard():
             )
     
     if st.sidebar.button("🔄 Refresh Data", type="primary"):
+        st.session_state.pop("_grey_cols_verified_once", None)
         _invalidate_all_data_caches()
         st.rerun()
 
