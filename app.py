@@ -6510,22 +6510,26 @@ def render_service_leave_duration_calculator(key_prefix="svc_calc"):
         period_summaries = []
         num_periods = max(1, int(st.session_state.get(count_key, 1)))
 
+        today_d = get_cta_today()
+        min_calc_date = date(1950, 1, 1)
+        max_calc_date = date(3000, 12, 31)
+
         for i in range(num_periods):
             c_p1, c_p2, c_p3 = st.columns([1.8, 1.8, 2.4])
             with c_p1:
                 sd = st.date_input(
                     f"Period #{i + 1} Start Date",
-                    value=get_cta_today(),
-                    min_value=date(1960, 1, 1),
-                    max_value=date(2040, 12, 31),
+                    value=today_d,
+                    min_value=min_calc_date,
+                    max_value=max_calc_date,
                     key=f"{key_prefix}_sd_{i}",
                 )
             with c_p2:
                 ed = st.date_input(
                     f"Period #{i + 1} End Date",
-                    value=get_cta_today(),
-                    min_value=date(1960, 1, 1),
-                    max_value=date(2040, 12, 31),
+                    value=today_d,
+                    min_value=min_calc_date,
+                    max_value=max_calc_date,
                     key=f"{key_prefix}_ed_{i}",
                 )
             with c_p3:
@@ -7095,8 +7099,8 @@ def render_system_settings(is_admin=True):
                 new_join = st.date_input(
                     "Official Joining Date *",
                     value=get_cta_today(),
-                    min_value=date(1960, 1, 1),
-                    max_value=date(2035, 12, 31),
+                    min_value=date(1950, 1, 1),
+                    max_value=date(3000, 12, 31),
                     help=STAFF_MASTER_FIELD_HELP["JoiningDate"],
                     key="add_stf_join",
                 )
@@ -7403,8 +7407,8 @@ def render_system_settings(is_admin=True):
                     edit_join = st.date_input(
                         "JoiningDate",
                         value=cur_join_date,
-                        min_value=date(1960, 1, 1),
-                        max_value=date(2035, 12, 31),
+                        min_value=date(1950, 1, 1),
+                        max_value=date(3000, 12, 31),
                         help=STAFF_MASTER_FIELD_HELP["JoiningDate"],
                         key=f"ed_join_{e_user}",
                         disabled=not is_central_viewer,
@@ -11754,9 +11758,35 @@ Live active policy numbers loaded from `LeaveRules`:
 
 def main_dashboard():
 
-    # AUTO-SYNC USERS -> STAFF MASTER (in-place renames, new users, and direct Google Sheet edits to Post / JoiningDate / Branch)
+    # AUTO-ASSIGN MISSING NTFY TOPICS & AUTO-SYNC USERS -> STAFF MASTER
     users_df = load_users_data()
     staff_df = load_staff_master()
+    if users_df is not None and not users_df.empty:
+        if "NtfyTopic" not in users_df.columns:
+            users_df["NtfyTopic"] = ""
+        users_df["NtfyTopic"] = users_df["NtfyTopic"].astype(object)
+        existing_topics = {
+            str(t).strip()
+            for t in users_df["NtfyTopic"].dropna().tolist()
+            if str(t).strip() and str(t).strip().lower() not in ("nan", "none", "null")
+        }
+        ntfy_needs_sync = False
+        for u_idx in users_df.index:
+            u_nm = "" if pd.isna(users_df.at[u_idx, "Name"]) else str(users_df.at[u_idx, "Name"]).strip()
+            if not u_nm or u_nm.lower() in ("nan", "none"):
+                continue
+            cur_top = "" if pd.isna(users_df.at[u_idx, "NtfyTopic"]) else str(users_df.at[u_idx, "NtfyTopic"]).strip()
+            if not cur_top or cur_top.lower() in ("nan", "none", "null"):
+                new_top = generate_user_ntfy_topic()
+                while new_top in existing_topics:
+                    new_top = generate_user_ntfy_topic()
+                users_df.at[u_idx, "NtfyTopic"] = new_top
+                existing_topics.add(new_top)
+                ntfy_needs_sync = True
+        if ntfy_needs_sync:
+            _gsheets_retry(conn.update, worksheet="Users", data=users_df)
+            _invalidate_sheet_cache("Users")
+
     if users_df is not None and staff_df is not None:
         sm_needs_sync = False
 
